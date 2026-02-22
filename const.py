@@ -23,17 +23,21 @@ STOCK_LIST_BAK = [
     "688102"
 ]
 
-# ETF 代码列表
-ETF_LIST = [
+# ==================== ETF 池子（用于辅助判断市场情绪）====================
+ETF_POOL = [
     "510050",   # 上证50 ETF
+    "510300",   # 沪深300 ETF
+    "159915",   # 创业板 ETF
+    "513010",   # 恒生科技 ETF
+    "510500",   # 中证500 ETF
 ]
 
 # ==================== 默认日期配置 ====================
 # 默认同步开始日期 (YYYYMMDD)
-DEFAULT_START_DATE = "20220101"
+DEFAULT_START_DATE = "20240101"
 
 # 默认同步结束日期 (YYYYMMDD)
-DEFAULT_END_DATE = "20240101"
+DEFAULT_END_DATE = "20260213"
 
 # ==================== 数据库路径配置 ====================
 # SQLite 数据库基础目录
@@ -69,6 +73,9 @@ MIN_TRADE_UNIT = 100
 
 # 全量股票列表文件路径
 STOCK_LIST_FILE = "/Users/yanglei/Documents/moltbot/scripts/stock_list.txt"
+
+# 多进程配置
+MAX_WORKERS = 8  # 最大并行进程数
 
 
 def get_full_stock():

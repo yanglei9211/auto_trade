@@ -3,6 +3,7 @@
 多股票回测脚本
 
 基于 const.py 中的 STOCK_LIST 股票池进行回测
+集成 calc.py 的风险控制功能
 """
 
 import sqlite3
@@ -11,13 +12,21 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 
 # 导入常量配置
 from const import (
     STOCK_LIST, INITIAL_CAPITAL, MAX_POSITION, MIN_POSITION,
     SINGLE_TRADE_RATIO, COMMISSION_RATE, STAMP_TAX_RATE, MIN_TRADE_UNIT,
-    STOCK_DB_PATH, get_full_stock
+    STOCK_DB_PATH, get_full_stock, MAX_WORKERS
 )
+
+# 导入 calc.py 的风险管理和信号生成功能
+from calc import RiskManager, get_trade_signal, Signal
+
+# 导入市场情绪分析
+from market_sentiment import get_market_sentiment, get_position_limit
 
 # 输出文件路径
 OUTPUT_FILE = Path(__file__).parent / "eval_output.txt"
@@ -59,14 +68,26 @@ MAX_STOCK_POSITION = 0.2     # 单只股票最多占用 20% 资金
 
 @dataclass
 class StockPosition:
-    """股票持仓"""
+    """股票持仓（扩展版，支持风控）"""
     code: str
     shares: int = 0
     avg_cost: float = 0.0
+    entry_date: str = ""           # 入场日期
+    highest_price: float = 0.0     # 持仓期间最高价（用于移动止损）
+    hold_days: int = 0             # 持仓天数
 
     @property
     def market_value(self, price: float = 0) -> float:
         return self.shares * price
+
+    def update_highest_price(self, current_price: float):
+        """更新持仓期间最高价"""
+        if current_price > self.highest_price:
+            self.highest_price = current_price
+
+    def increment_hold_days(self):
+        """增加持仓天数"""
+        self.hold_days += 1
 
 
 @dataclass
@@ -84,9 +105,11 @@ class DailyRecord:
 
 
 class MultiStockBacktestEngine:
-    """多股票回测引擎"""
+    """多股票回测引擎（集成风控和市场情绪）"""
 
-    def __init__(self, stock_pool: List[str], start_date: str, end_date: str, initial_cash: float, code_name_map: Dict[str, str] = None):
+    def __init__(self, stock_pool: List[str], start_date: str, end_date: str, initial_cash: float, 
+                 code_name_map: Dict[str, str] = None, risk_manager: RiskManager = None,
+                 enable_market_sentiment: bool = True):
         self.stock_pool = stock_pool
         self.start_date = start_date
         self.end_date = end_date
@@ -98,10 +121,210 @@ class MultiStockBacktestEngine:
         self.daily_prices: Dict[str, Dict[str, float]] = {}  # date -> {code: price}
         self.code_name_map = code_name_map or {}  # 代码到名称的映射
         self.output_file = None  # 输出文件句柄
+        
+        # 初始化风险管理器（使用传入的或创建默认实例）
+        self.risk_manager = risk_manager or RiskManager()
+        
+        # 市场情绪控制
+        self.enable_market_sentiment = enable_market_sentiment
+        self.current_position_limit = 1.0  # 当前仓位上限（根据市场情绪动态调整）
+        self.sentiment_history: Dict[str, Dict] = {}  # 记录每日情绪
 
     def get_stock_name(self, code: str) -> str:
         """获取股票名称"""
         return self.code_name_map.get(code, code)
+
+    def get_current_total_position_ratio(self, daily_prices: Dict[str, float]) -> float:
+        """计算当前总仓位比例"""
+        total_market_value = 0.0
+        for code, position in self.positions.items():
+            if position.shares > 0 and code in daily_prices:
+                total_market_value += position.shares * daily_prices[code]
+        
+        total_value = self.cash + total_market_value
+        if total_value <= 0:
+            return 0.0
+        return total_market_value / total_value
+
+    def update_market_sentiment(self, date: str) -> Dict:
+        """更新市场情绪并返回情绪数据"""
+        if not self.enable_market_sentiment:
+            self.current_position_limit = 1.0
+            return {"score": 1.0, "position_ratio": 1.0, "description": "情绪控制已关闭"}
+        
+        try:
+            sentiment = get_market_sentiment(date)
+            self.current_position_limit = sentiment["position_ratio"]
+            self.sentiment_history[date] = sentiment
+            return sentiment
+        except Exception as e:
+            # 如果情绪分析失败，默认允许满仓
+            self.current_position_limit = 1.0
+            return {"score": 1.0, "position_ratio": 1.0, "description": f"情绪分析失败: {e}"}
+
+    def can_open_new_position(self, daily_prices: Dict[str, float], planned_invest: float) -> bool:
+        """检查是否可以开新仓（检查总仓位限制）"""
+        current_ratio = self.get_current_total_position_ratio(daily_prices)
+        planned_ratio = planned_invest / (self.cash + sum(
+            self.positions[c].shares * p for c, p in daily_prices.items() 
+            if self.positions[c].shares > 0
+        ))
+        
+        return (current_ratio + planned_ratio) <= self.current_position_limit
+
+    @staticmethod
+    def _calculate_single_signal_static(args: Tuple) -> Dict:
+        """
+        计算单只股票的信号（静态方法，用于多进程）
+        
+        参数:
+            args: (code, date, price, position_shares, position_avg_cost, 
+                   position_highest_price, position_hold_days, initial_cash)
+        
+        返回:
+            信号信息字典
+        """
+        (code, date, price, position_shares, position_avg_cost,
+         position_highest_price, position_hold_days, initial_cash) = args
+        
+        try:
+            # 导入必要的模块（在子进程中）
+            from calc import get_trade_signal, RiskManager
+            from const import STOCK_DB_PATH, MAX_POSITION, MIN_POSITION, SINGLE_TRADE_RATIO
+            
+            # 创建独立的风险管理器实例
+            risk_manager = RiskManager()
+            
+            # 调用信号生成
+            decision, _, _ = get_trade_signal(
+                code=code,
+                date=date,
+                hold=position_shares,
+                initial_capital=initial_cash,
+                max_position=MAX_POSITION,
+                min_position=MIN_POSITION,
+                single_trade_ratio=SINGLE_TRADE_RATIO,
+                risk_manager=risk_manager,
+                entry_price=position_avg_cost if position_shares > 0 else 0,
+                highest_price=position_highest_price if position_shares > 0 else price,
+                hold_days=position_hold_days if position_shares > 0 else 0,
+                db_path=STOCK_DB_PATH,
+                table_name="stock_daily"
+            )
+            
+            return {
+                'code': code,
+                'signal': decision.signal.value,
+                'shares': decision.shares,
+                'reason': decision.reason,
+                'score': decision.confidence,
+                'price': price
+            }
+        except Exception as e:
+            return {
+                'code': code,
+                'signal': 'HOLD',
+                'shares': 0,
+                'reason': f'信号生成失败: {str(e)}',
+                'score': 0,
+                'price': price
+            }
+
+    def _prepare_signal_args(self, date: str, daily_prices: Dict[str, float]) -> List[Tuple]:
+        """准备多进程计算的参数列表"""
+        args_list = []
+        for code, price in daily_prices.items():
+            position = self.positions[code]
+            args = (
+                code,
+                date,
+                price,
+                position.shares,
+                position.avg_cost,
+                position.highest_price,
+                position.hold_days,
+                self.initial_cash
+            )
+            args_list.append(args)
+        return args_list
+
+    def _calculate_signals_parallel(self, date: str, daily_prices: Dict[str, float]) -> List[Dict]:
+        """
+        并行计算所有股票的信号
+        
+        返回:
+            信号信息列表
+        """
+        # 准备参数列表
+        args_list = self._prepare_signal_args(date, daily_prices)
+        
+        signals = []
+        
+        # 确定工作进程数
+        workers = min(MAX_WORKERS, cpu_count(), len(args_list))
+        
+        if workers <= 1 or len(args_list) < 10:
+            # 股票数量少或只有一个worker，使用单进程
+            for args in args_list:
+                signal_info = self._calculate_single_signal_static(args)
+                signals.append(signal_info)
+        else:
+            # 使用多进程并行计算
+            self.print_and_write(f"  使用 {workers} 个进程并行计算 {len(args_list)} 只股票...")
+            
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                future_to_code = {
+                    executor.submit(self._calculate_single_signal_static, args): args[0] 
+                    for args in args_list
+                }
+                
+                completed = 0
+                for future in as_completed(future_to_code):
+                    code = future_to_code[future]
+                    try:
+                        signal_info = future.result()
+                        signals.append(signal_info)
+                    except Exception as e:
+                        # 如果某个进程失败，记录错误并返回HOLD
+                        signals.append({
+                            'code': code,
+                            'signal': 'HOLD',
+                            'shares': 0,
+                            'reason': f'多进程计算失败: {str(e)}',
+                            'score': 0,
+                            'price': daily_prices[code]
+                        })
+                    
+                    completed += 1
+                    if completed % 100 == 0:
+                        self.print_and_write(f"    已完成 {completed}/{len(args_list)}...")
+        
+        return signals
+
+    def _sort_signals_by_priority(self, signals: List[Dict]) -> List[Dict]:
+        """
+        按优先级排序信号
+        
+        排序规则:
+        1. SELL 信号优先（止损/止盈）
+        2. BUY 信号按评分降序（优先买入评分高的）
+        3. HOLD 信号最后
+        """
+        def sort_key(signal_info):
+            signal = signal_info['signal']
+            score = signal_info['score']
+            
+            if signal == 'SELL':
+                # 卖出信号优先级最高，按评分降序（先止损）
+                return (0, -score)
+            elif signal == 'BUY':
+                # 买入信号按评分降序
+                return (1, -score)
+            else:
+                # HOLD 信号最后
+                return (2, 0)
+        
+        return sorted(signals, key=sort_key)
 
     def open_output_file(self):
         """打开输出文件"""
@@ -158,71 +381,43 @@ class MultiStockBacktestEngine:
         conn.close()
         return days
 
-    def calculate_ma(self, code: str, date: str, period: int) -> float:
-        """计算移动平均线"""
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute(f"""
-            SELECT close FROM {TABLE_NAME}
-            WHERE code = ? AND date < ?
-            ORDER BY date DESC
-            LIMIT ?
-        """, (code, date, period))
-
-        prices = [row[0] for row in cursor.fetchall()]
-        conn.close()
-
-        if len(prices) < period:
-            return prices[0] if prices else 0
-        return sum(prices) / len(prices)
-
     def generate_signal(self, code: str, date: str, price: float) -> Tuple[str, int, str]:
         """
-        简单的多因子信号生成
+        使用 calc.py 的多因子策略生成信号（含风控）
         返回: (信号类型, 建议股数, 交易依据)
         """
-        # 获取历史数据计算均线
-        ma20 = self.calculate_ma(code, date, 20)
-        ma60 = self.calculate_ma(code, date, 60)
-
-        if ma20 == 0 or ma60 == 0:
-            return "HOLD", 0, "数据不足，无法计算均线"
-
         position = self.positions[code]
+        
+        try:
+            # 使用 calc.py 的 get_trade_signal 函数获取交易决策
+            # 传入正确的股票数据库配置
+            decision, _, _ = get_trade_signal(
+                code=code,
+                date=date,
+                hold=position.shares,
+                initial_capital=self.initial_cash,
+                max_position=MAX_POSITION,
+                min_position=MIN_POSITION,
+                single_trade_ratio=SINGLE_TRADE_RATIO,
+                risk_manager=self.risk_manager,
+                entry_price=position.avg_cost if position.shares > 0 else 0,
+                highest_price=position.highest_price if position.shares > 0 else price,
+                hold_days=position.hold_days if position.shares > 0 else 0,
+                db_path=DB_PATH,           # 使用 eval.py 的数据库路径
+                table_name=TABLE_NAME       # 使用 eval.py 的表名
+            )
+            
+            # 将 Signal 枚举转换为字符串
+            signal_str = decision.signal.value
+            
+            return signal_str, decision.shares, decision.reason
+            
+        except Exception as e:
+            # 数据不足或其他错误时返回 HOLD
+            return "HOLD", 0, f"信号生成失败: {str(e)}"
 
-        # 计算均线乖离率
-        ma20_deviation = (price - ma20) / ma20 * 100 if ma20 > 0 else 0
-        ma60_deviation = (price - ma60) / ma60 * 100 if ma60 > 0 else 0
-
-        # 判断趋势
-        trend = "UP" if ma20 > ma60 else "DOWN"
-
-        # 简单策略：价格突破20日均线买入，跌破卖出
-        if price > ma20 * 1.02 and position.shares == 0:
-            # 买入信号
-            max_invest = self.initial_cash * MAX_STOCK_POSITION
-            shares = int(max_invest / price / MIN_TRADE_UNIT) * MIN_TRADE_UNIT
-            reason = f"【买入信号】价格({price:.2f})突破MA20({ma20:.2f}) 2%以上，MA20乖离率{ma20_deviation:+.2f}%，趋势{trend}"
-            return "BUY", shares, reason
-        elif price < ma20 * 0.98 and position.shares > 0:
-            # 卖出信号
-            # 计算持仓盈亏
-            cost = position.avg_cost
-            pnl_pct = (price - cost) / cost * 100 if cost > 0 else 0
-            reason = f"【卖出信号】价格({price:.2f})跌破MA20({ma20:.2f}) 2%以上，持仓成本{cost:.2f}，当前盈亏{pnl_pct:+.2f}%"
-            return "SELL", position.shares, reason
-
-        # 持仓中但未触发卖出信号
-        if position.shares > 0:
-            cost = position.avg_cost
-            pnl_pct = (price - cost) / cost * 100 if cost > 0 else 0
-            return "HOLD", 0, f"【持仓观望】价格({price:.2f})在MA20({ma20:.2f})附近，持仓成本{cost:.2f}，当前盈亏{pnl_pct:+.2f}%"
-
-        return "HOLD", 0, f"【空仓观望】价格({price:.2f})未突破MA20({ma20:.2f})，MA20乖离率{ma20_deviation:+.2f}%"
-
-    def execute_trade(self, code: str, signal: str, shares: int, price: float) -> Dict:
-        """执行交易"""
+    def execute_trade(self, code: str, signal: str, shares: int, price: float, date: str) -> Dict:
+        """执行交易（含风控信息更新）"""
         result = {
             "code": code,
             "signal": signal,
@@ -259,6 +454,12 @@ class MultiStockBacktestEngine:
             old_cost = position.avg_cost * old_shares
             position.shares += actual_shares
             position.avg_cost = (old_cost + trade_amount) / position.shares
+            
+            # 风控信息：首次买入时记录入场日期和最高价
+            if old_shares == 0:
+                position.entry_date = date
+                position.highest_price = price
+                position.hold_days = 0
 
             self.cash -= total_cost
             self.trade_count += 1
@@ -281,7 +482,11 @@ class MultiStockBacktestEngine:
             # 更新持仓
             position.shares -= actual_shares
             if position.shares == 0:
+                # 清仓时重置风控信息
                 position.avg_cost = 0
+                position.entry_date = ""
+                position.highest_price = 0
+                position.hold_days = 0
 
             self.cash += trade_amount - commission - stamp_tax
             self.trade_count += 1
@@ -329,22 +534,51 @@ class MultiStockBacktestEngine:
             total_commission = 0.0
             total_stamp_tax = 0.0
 
-            # 对每只股票生成信号并执行交易
-            for code in self.stock_pool:
-                if code not in daily_prices:
-                    continue
+            # 更新市场情绪（每日开盘前）
+            sentiment = self.update_market_sentiment(date)
+            current_position_ratio = self.get_current_total_position_ratio(daily_prices)
 
+            # 更新所有持仓的最高价和持仓天数（用于移动止损和时间止损）
+            for code, position in self.positions.items():
+                if position.shares > 0 and code in daily_prices:
+                    position.update_highest_price(daily_prices[code])
+                    position.increment_hold_days()
+
+            # 并行计算所有股票的信号和评分
+            signals = self._calculate_signals_parallel(date, daily_prices)
+            
+            # 按评分排序：卖出信号优先（止损），然后按买入评分降序
+            sorted_signals = self._sort_signals_by_priority(signals)
+
+            # 按优先级顺序执行交易
+            for signal_info in sorted_signals:
+                code = signal_info['code']
+                signal = signal_info['signal']
+                shares = signal_info['shares']
+                reason = signal_info['reason']
+                score = signal_info['score']
                 price = daily_prices[code]
-                signal, shares, reason = self.generate_signal(code, date, price)
 
                 if signal != "HOLD":
-                    trade = self.execute_trade(code, signal, shares, price)
+                    # 买入前检查仓位限制
+                    if signal == "BUY":
+                        planned_invest = shares * price
+                        if not self.can_open_new_position(daily_prices, planned_invest):
+                            # 超出仓位限制，跳过买入
+                            reason += f" [跳过: 仓位限制 {self.current_position_limit*100:.0f}%，当前 {current_position_ratio*100:.1f}%]"
+                            continue
+
+                    trade = self.execute_trade(code, signal, shares, price, date)
                     if trade["success"]:
-                        trade["reason"] = reason  # 添加交易依据
-                        trade["name"] = self.get_stock_name(code)  # 添加股票名称
+                        trade["reason"] = reason
+                        trade["name"] = self.get_stock_name(code)
+                        trade['score'] = score  # 记录评分
                         daily_trades.append(trade)
                         total_commission += trade["commission"]
                         total_stamp_tax += trade["stamp_tax"]
+                        
+                        # 更新当前仓位比例
+                        current_position_ratio = self.get_current_total_position_ratio(daily_prices)
 
             # 计算当日总市值
             total_market_value = 0.0
@@ -388,6 +622,16 @@ class MultiStockBacktestEngine:
         self.print_and_write(f"\n{'='*100}")
         self.print_and_write(f"日期: {record.date}")
         self.print_and_write(f"{'='*100}")
+
+        # 显示市场情绪
+        sentiment = self.sentiment_history.get(record.date, {})
+        if sentiment:
+            self.print_and_write(f"\n【市场情绪】")
+            self.print_and_write(f"  情绪得分: {sentiment.get('score', 0):.2f}")
+            self.print_and_write(f"  仓位限制: {sentiment.get('position_ratio', 1.0)*100:.0f}%")
+            self.print_and_write(f"  情绪描述: {sentiment.get('description', 'N/A')}")
+            self.print_and_write(f"  ETF状态: MA20上方{sentiment.get('above_ma20_count', 0)}/{sentiment.get('total_etfs', 5)}, "
+                               f"趋势向上{sentiment.get('up_trend_count', 0)}/{sentiment.get('total_etfs', 5)}")
 
         # 打印持仓详情（只显示有持仓的股票）
         self.print_and_write(f"\n【持仓详情】")
@@ -649,12 +893,24 @@ def main():
     if len(stock_pool) > 500:
         print(f"注意: 股票数量较多({len(stock_pool)}只)，回测可能需要较长时间")
 
+    # 创建风险管理器（可根据需要调整参数）
+    risk_manager = RiskManager(
+        stop_loss_pct=0.05,      # 5%固定止损
+        trail_stop_pct=0.10,     # 10%移动止损
+        atr_multiplier=2.0,      # ATR止损倍数
+        time_stop_days=10,       # 10天时间止损
+        max_position=0.2,        # 单只股票最大仓位20%
+        max_total_position=0.8   # 总最大仓位80%
+    )
+
     engine = MultiStockBacktestEngine(
         stock_pool=stock_pool,
         start_date=START_DATE,
         end_date=END_DATE,
         initial_cash=INITIAL_CASH,
-        code_name_map=code_name_map
+        code_name_map=code_name_map,
+        risk_manager=risk_manager,
+        enable_market_sentiment=True  # 启用市场情绪控制
     )
     engine.load_all_data()
     engine.run()

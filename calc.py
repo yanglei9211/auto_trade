@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ETF 交易信号计算模块
+股票交易信号计算模块
 
 提供多因子交易策略的计算功能，可被回测脚本导入使用
 """
@@ -12,14 +12,194 @@ from typing import List, Dict, Tuple
 from enum import Enum
 
 # ==================== 配置部分 ====================
-DB_PATH = "/Users/yanglei/Documents/sqlite/sqlite-data/etf_data.db"
-TABLE_NAME = "etf_daily"
+# 默认使用股票数据库，可在调用时通过参数覆盖
+DEFAULT_DB_PATH = "/Users/yanglei/Documents/sqlite/sqlite-data/stock_data.db"
+DEFAULT_TABLE_NAME = "stock_daily"
+
+# 兼容旧代码
+DB_PATH = DEFAULT_DB_PATH
+TABLE_NAME = DEFAULT_TABLE_NAME
 
 # 默认交易参数（可在回测脚本中覆盖）
 DEFAULT_INITIAL_CAPITAL = 100000  # 初始资金（用于计算仓位）
 DEFAULT_MAX_POSITION = 0.95       # 最大仓位比例
 DEFAULT_MIN_POSITION = 0.0        # 最小仓位比例
-DEFAULT_SINGLE_TRADE_RATIO = 0.2  # 单次交易占总资金比例
+DEFAULT_SINGLE_TRADE_RATIO = 0.2   # 单次交易占总资金比例
+
+# 默认止损参数
+DEFAULT_STOP_LOSS_PCT = 0.05       # 固定止损比例 (5%)
+DEFAULT_TRAIL_STOP_PCT = 0.10      # 移动止损比例 (10%)
+DEFAULT_ATR_MULTIPLIER = 2.0       # ATR止损倍数
+DEFAULT_TIME_STOP_DAYS = 10        # 时间止损天数
+
+
+class RiskManager:
+    """
+    风险管理器
+    
+    提供止损和仓位动态调整功能
+    """
+
+    def __init__(
+        self,
+        stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
+        trail_stop_pct: float = DEFAULT_TRAIL_STOP_PCT,
+        atr_multiplier: float = DEFAULT_ATR_MULTIPLIER,
+        time_stop_days: int = DEFAULT_TIME_STOP_DAYS,
+        max_position: float = 0.2,
+        max_total_position: float = 0.8
+    ):
+        """
+        初始化风险管理器
+        
+        参数:
+            stop_loss_pct: 固定止损比例 (如 0.05 表示亏损5%止损)
+            trail_stop_pct: 移动止损比例 (如 0.10 表示从最高点回落10%止损)
+            atr_multiplier: ATR止损倍数
+            time_stop_days: 时间止损天数 (持仓N天未盈利则卖出)
+            max_position: 单只股票最大仓位比例
+            max_total_position: 总最大仓位比例
+        """
+        self.stop_loss_pct = stop_loss_pct
+        self.trail_stop_pct = trail_stop_pct
+        self.atr_multiplier = atr_multiplier
+        self.time_stop_days = time_stop_days
+        self.max_position = max_position
+        self.max_total_position = max_total_position
+
+    def should_stop_loss(
+        self,
+        entry_price: float,
+        current_price: float,
+        highest_price: float,
+        atr: float = 0,
+        hold_days: int = 0
+    ) -> Tuple[bool, str]:
+        """
+        检查是否触发止损
+        
+        参数:
+            entry_price: 入场价格
+            current_price: 当前价格
+            highest_price: 持仓期间最高价
+            atr: ATR值 (可选)
+            hold_days: 持仓天数 (可选)
+            
+        返回:
+            (是否止损, 止损原因)
+        """
+        # 1. 固定止损
+        loss_pct = (entry_price - current_price) / entry_price
+        if loss_pct >= self.stop_loss_pct:
+            return True, f"固定止损 ({loss_pct*100:.1f}%)"
+
+        # 2. 移动止损 (保护利润)
+        if highest_price > entry_price:
+            drawdown_pct = (highest_price - current_price) / highest_price
+            if drawdown_pct >= self.trail_stop_pct:
+                return True, f"移动止损 (回撤{drawdown_pct*100:.1f}%)"
+
+        # 3. ATR自适应止损
+        if atr > 0:
+            atr_stop_price = entry_price - self.atr_multiplier * atr
+            if current_price < atr_stop_price:
+                return True, f"ATR止损 (跌破{atr_stop_price:.2f})"
+
+        # 4. 时间止损
+        if hold_days >= self.time_stop_days and current_price <= entry_price:
+            return True, f"时间止损 (持仓{hold_days}天未盈利)"
+
+        return False, ""
+
+    def calculate_position_size(
+        self,
+        confidence: float,
+        volatility: float,
+        atr: float,
+        available_capital: float,
+        current_price: float
+    ) -> int:
+        """
+        动态计算仓位
+        
+        参数:
+            confidence: 信号置信度 (0-1)
+            volatility: 波动率 (年化)
+            atr: ATR值
+            available_capital: 可用资金
+            current_price: 当前价格
+            
+        返回:
+            建议买入股数 (手取整)
+        """
+        # 1. 基础仓位 = 置信度
+        base_ratio = confidence
+
+        # 2. 波动率调整：波动越大仓位越小
+        if volatility < 0.15:
+            vol_adj = 1.0
+        elif volatility > 0.30:
+            vol_adj = 0.5
+        else:
+            vol_adj = 1.0 - (volatility - 0.15) / 0.15 * 0.5
+
+        # 3. ATR调整：ATR越大仓位越小 (控制单日风险)
+        if atr > 0:
+            atr_ratio = atr / current_price
+            if atr_ratio < 0.02:
+                atr_adj = 1.0
+            elif atr_ratio > 0.04:
+                atr_adj = 0.5
+            else:
+                atr_adj = 1.0 - (atr_ratio - 0.02) / 0.02 * 0.5
+        else:
+            atr_adj = 1.0
+
+        # 4. 最终仓位
+        position_ratio = base_ratio * vol_adj * atr_adj
+
+        # 5. 限制最大仓位
+        position_ratio = min(position_ratio, self.max_position)
+
+        # 6. 计算股数
+        amount = available_capital * position_ratio
+        shares = int(amount / current_price / 100) * 100  # 手取整
+
+        return max(shares, 0)
+
+    def calculate_sell_shares(
+        self,
+        current_hold: int,
+        entry_price: float,
+        current_price: float,
+        force_full: bool = False
+    ) -> int:
+        """
+        计算卖出股数
+        
+        参数:
+            current_hold: 当前持仓
+            entry_price: 持仓成本
+            current_price: 当前价格
+            force_full: 是否强制全卖
+            
+        返回:
+            建议卖出股数
+        """
+        if current_hold <= 0:
+            return 0
+
+        if force_full:
+            return current_hold
+
+        # 盈利超过20%可考虑分批卖出
+        profit_pct = (current_price - entry_price) / entry_price
+        if profit_pct > 0.20:
+            return min(current_hold, int(current_hold * 0.5 / 100) * 100)
+        elif profit_pct > 0.10:
+            return min(current_hold, int(current_hold * 0.25 / 100) * 100)
+        else:
+            return current_hold
 
 
 class Signal(Enum):
@@ -160,7 +340,20 @@ class Strategy:
                  initial_capital: float = DEFAULT_INITIAL_CAPITAL,
                  max_position: float = DEFAULT_MAX_POSITION,
                  min_position: float = DEFAULT_MIN_POSITION,
-                 single_trade_ratio: float = DEFAULT_SINGLE_TRADE_RATIO):
+                 single_trade_ratio: float = DEFAULT_SINGLE_TRADE_RATIO,
+                 risk_manager: RiskManager = None):
+        """
+        初始化策略
+        
+        参数:
+            data: 历史市场数据
+            current_price: 当前价格
+            initial_capital: 初始资金
+            max_position: 最大仓位比例
+            min_position: 最小仓位比例
+            single_trade_ratio: 单次交易比例
+            risk_manager: 风险管理器 (可选)
+        """
         self.factor = FactorCalculator(data)
         self.current_price = current_price
         self.signals: Dict[str, float] = {}
@@ -168,8 +361,16 @@ class Strategy:
         self.max_position = max_position
         self.min_position = min_position
         self.single_trade_ratio = single_trade_ratio
+        
+        # 使用传入的风险管理器或创建默认实例
+        self.risk_manager = risk_manager or RiskManager()
+        
+        # 计算当前波动率和ATR供仓位管理使用
+        self.volatility = self.factor.volatility(20)
+        self.atr = self.factor.atr(14)
 
     def calculate_all_factors(self) -> Dict[str, float]:
+        """计算所有因子得分 (-1 到 1)"""
         """计算所有因子得分 (-1 到 1)"""
         # 1. 趋势因子 (基于均线)
         ma5 = self.factor.ma(5)
@@ -238,10 +439,46 @@ class Strategy:
             self.calculate_all_factors()
         return sum(self.signals.values())
 
-    def generate_signal(self, current_hold: int) -> TradeDecision:
-        """生成交易信号"""
+    def generate_signal(self, current_hold: int, entry_price: float = 0, 
+                        highest_price: float = 0, hold_days: int = 0) -> TradeDecision:
+        """
+        生成交易信号 (含风险管理)
+        
+        参数:
+            current_hold: 当前持仓股数
+            entry_price: 持仓成本价 (可选，用于止损判断)
+            highest_price: 持仓期间最高价 (可选，用于移动止损)
+            hold_days: 持仓天数 (可选，用于时间止损)
+            
+        返回:
+            TradeDecision: 交易决策
+        """
         score = self.get_composite_score()
+        
+        # ========== 止损检查 ==========
+        if current_hold > 0 and entry_price > 0:
+            # 使用风险管理器检查止损
+            should_stop, stop_reason = self.risk_manager.should_stop_loss(
+                entry_price=entry_price,
+                current_price=self.current_price,
+                highest_price=highest_price if highest_price > 0 else self.current_price,
+                atr=self.atr,
+                hold_days=hold_days
+            )
+            
+            if should_stop:
+                # 触发止损，强制卖出
+                shares = self.risk_manager.calculate_sell_shares(
+                    current_hold=current_hold,
+                    entry_price=entry_price,
+                    current_price=self.current_price,
+                    force_full=True
+                )
+                reason = f"【止损】{stop_reason}, 综合得分: {score:+.3f}"
+                confidence = 0.9  # 止损信号置信度高
+                return TradeDecision(Signal.SELL, shares, reason, confidence)
 
+        # ========== 正常信号生成 ==========
         # 根据得分确定信号
         if score > 0.3:
             signal = Signal.BUY
@@ -258,37 +495,79 @@ class Strategy:
         elif signal == Signal.SELL and current_hold == 0:
             signal = Signal.HOLD
 
-        # 计算交易股数
+        # ========== 计算交易股数 (含动态仓位) ==========
         shares = 0
+        confidence = min(abs(score) * 2, 1.0)
+        
         if signal == Signal.BUY:
-            # 计算可买入金额
-            available_capital = self.initial_capital * (1 - current_hold * self.current_price / self.initial_capital)
-            trade_amount = min(available_capital * 0.3, self.initial_capital * self.single_trade_ratio)
-            shares = int(trade_amount / self.current_price / 100) * 100  # 手数取整
-        elif signal == Signal.SELL:
-            # 卖出部分仓位
-            if current_hold > 0:
-                shares = min(current_hold, int(current_hold * 0.5 / 100) * 100)
+            # 可用资金
+            used_capital = current_hold * self.current_price
+            available_capital = self.initial_capital - used_capital
+            
+            if available_capital > 0:
+                # 使用风险管理器计算动态仓位
+                shares = self.risk_manager.calculate_position_size(
+                    confidence=confidence,
+                    volatility=self.volatility,
+                    atr=self.atr,
+                    available_capital=available_capital,
+                    current_price=self.current_price
+                )
+                
+                # 如果计算结果为0，使用原来的fallback逻辑
                 if shares == 0:
-                    shares = current_hold  # 全部卖出
+                    trade_amount = min(available_capital * 0.3, 
+                                     self.initial_capital * self.single_trade_ratio)
+                    shares = int(trade_amount / self.current_price / 100) * 100
+                    
+        elif signal == Signal.SELL:
+            if current_hold > 0:
+                # 使用风险管理器计算卖出股数
+                shares = self.risk_manager.calculate_sell_shares(
+                    current_hold=current_hold,
+                    entry_price=entry_price if entry_price > 0 else self.current_price,
+                    current_price=self.current_price,
+                    force_full=False
+                )
+                if shares == 0:
+                    shares = current_hold
 
         # 生成理由
-        reason_parts = [f"{k}={v:+.2f}" for k, v in self.signals.items() if abs(v) > 0.05]
-        reason = f"综合得分: {score:+.3f}, 主要因子: {', '.join(reason_parts[:4])}"
-
-        confidence = min(abs(score) * 2, 1.0)
+        reason_parts = []
+        
+        # 添加因子信息
+        factor_info = [f"{k}={v:+.2f}" for k, v in self.signals.items() if abs(v) > 0.05]
+        if factor_info:
+            reason_parts.append(f"因子: {', '.join(factor_info[:3])}")
+        
+        # 添加仓位调整信息
+        if signal == Signal.BUY and shares > 0:
+            reason_parts.append(f"波动率: {self.volatility*100:.1f}%, ATR: {self.atr:.2f}")
+        
+        # 添加风险提示
+        if current_hold > 0 and entry_price > 0:
+            loss_pct = (self.current_price - entry_price) / entry_price
+            if loss_pct > 0:
+                reason_parts.append(f"持仓亏损: {loss_pct*100:.1f}%")
+        
+        reason = f"综合得分: {score:+.3f}, {', '.join(reason_parts)}"
 
         return TradeDecision(signal, shares, reason, confidence)
 
 
-def load_historical_data(code: str, before_date: str) -> List[MarketData]:
+def load_historical_data(code: str, before_date: str, 
+                         db_path: str = None, table_name: str = None) -> List[MarketData]:
     """加载历史数据"""
-    conn = sqlite3.connect(DB_PATH)
+    # 使用传入的参数或默认值
+    db = db_path or DEFAULT_DB_PATH
+    table = table_name or DEFAULT_TABLE_NAME
+    
+    conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     cursor.execute(f"""
-        SELECT * FROM {TABLE_NAME}
+        SELECT * FROM {table}
         WHERE code = ? AND date < ?
         ORDER BY date ASC
     """, (code, before_date))
@@ -326,24 +605,36 @@ def get_trade_signal(code: str, date: str, hold: int,
                      initial_capital: float = DEFAULT_INITIAL_CAPITAL,
                      max_position: float = DEFAULT_MAX_POSITION,
                      min_position: float = DEFAULT_MIN_POSITION,
-                     single_trade_ratio: float = DEFAULT_SINGLE_TRADE_RATIO) -> Tuple[TradeDecision, List[MarketData], float]:
+                     single_trade_ratio: float = DEFAULT_SINGLE_TRADE_RATIO,
+                     risk_manager: RiskManager = None,
+                     entry_price: float = 0,
+                     highest_price: float = 0,
+                     hold_days: int = 0,
+                     db_path: str = None,
+                     table_name: str = None) -> Tuple[TradeDecision, List[MarketData], float]:
     """
     获取交易信号（供回测脚本调用）
 
     参数:
-        code: ETF代码
+        code: 股票代码
         date: 日期 (YYYY-MM-DD)
         hold: 当前持仓
         initial_capital: 初始资金
         max_position: 最大仓位比例
         min_position: 最小仓位比例
         single_trade_ratio: 单次交易比例
+        risk_manager: 风险管理器 (可选)
+        entry_price: 持仓成本价 (可选，用于止损)
+        highest_price: 持仓期间最高价 (可选，用于移动止损)
+        hold_days: 持仓天数 (可选，用于时间止损)
+        db_path: 数据库路径 (可选，默认使用股票数据库)
+        table_name: 表名 (可选，默认使用stock_daily)
 
     返回:
         (交易决策, 历史数据列表, 当前价格)
     """
     # 加载历史数据
-    data = load_historical_data(code, date)
+    data = load_historical_data(code, date, db_path, table_name)
 
     if len(data) < 20:
         raise ValueError(f"历史数据不足 ({len(data)} 天)，无法生成有效信号")
@@ -352,8 +643,9 @@ def get_trade_signal(code: str, date: str, hold: int,
     current_price = data[-1].close
 
     # 计算因子并生成信号
-    strategy = Strategy(data, current_price, initial_capital, max_position, min_position, single_trade_ratio)
-    decision = strategy.generate_signal(hold)
+    strategy = Strategy(data, current_price, initial_capital, max_position, 
+                        min_position, single_trade_ratio, risk_manager)
+    decision = strategy.generate_signal(hold, entry_price, highest_price, hold_days)
 
     return decision, data, current_price
 
@@ -363,7 +655,7 @@ def calculate_factors(code: str, date: str) -> Dict[str, float]:
     计算所有因子得分（供分析使用）
 
     参数:
-        code: ETF代码
+        code: 股票代码
         date: 日期 (YYYY-MM-DD)
 
     返回:
