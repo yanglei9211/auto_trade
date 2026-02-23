@@ -45,8 +45,8 @@ TABLE_NAME = "stock_daily"
 # ==================== 回测参数配置（可修改） ====================
 
 # 回测时间范围
-START_DATE = "2024-01-01"    # 回测开始日期 (YYYY-MM-DD)
-END_DATE = "2025-01-01"      # 回测结束日期 (YYYY-MM-DD)
+START_DATE = "2023-01-01"    # 回测开始日期 (YYYY-MM-DD)
+END_DATE = "2025-02-13"      # 回测结束日期 (YYYY-MM-DD)
 
 # 股票池（从 const.py 导入，也可在此覆盖）
 # 如果 STOCK_LIST 为空，则自动获取全部股票
@@ -54,10 +54,26 @@ STOCK_POOL = STOCK_LIST
 
 
 def get_stock_pool():
-    """获取股票池"""
+    """获取股票池和代码名称映射"""
     if STOCK_POOL and len(STOCK_POOL) > 0:
         print(f"使用自定义股票池，共 {len(STOCK_POOL)} 只")
-        return STOCK_POOL
+        # 尝试从文件加载名称映射
+        code_name_map = {}
+        try:
+            from pathlib import Path
+            stock_file = Path(STOCK_LIST_FILE)
+            if stock_file.exists():
+                with open(stock_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#') or line.startswith('-'):
+                            continue
+                        parts = line.split(maxsplit=1)
+                        if len(parts) >= 2:
+                            code_name_map[parts[0].strip()] = parts[1].strip()
+        except Exception:
+            pass
+        return STOCK_POOL, code_name_map
     else:
         print("STOCK_LIST 为空，自动获取全部股票列表...")
         code_list, code_name_map = get_full_stock()

@@ -307,14 +307,33 @@ class FactorCalculator:
         return 100 - (100 / (1 + rs))
 
     def macd(self) -> Tuple[float, float, float]:
-        """MACD指标，返回 (macd_line, signal_line, histogram)"""
-        if len(self.closes) < 26:
+        """MACD指标，返回 (macd_line, signal_line, histogram)
+
+        标准定义：
+          DIF = EMA12(close) - EMA26(close)
+          DEA = EMA9(DIF)
+          HIST = DIF - DEA
+        """
+        if len(self.closes) < 26 + 9:
             return 0, 0, 0
-        ema12 = self.ema(12)
-        ema26 = self.ema(26)
-        macd_line = ema12 - ema26
-        # 简化计算 signal line (9日EMA of MACD)
-        signal_line = macd_line * 0.2  # 简化处理
+
+        # 计算EMA序列（用于DEA）
+        def ema_series(values: np.ndarray, period: int) -> np.ndarray:
+            alpha = 2 / (period + 1)
+            out = np.zeros_like(values, dtype=float)
+            out[0] = values[0]
+            for i in range(1, len(values)):
+                out[i] = alpha * values[i] + (1 - alpha) * out[i-1]
+            return out
+
+        closes = self.closes.astype(float)
+        ema12_s = ema_series(closes, 12)
+        ema26_s = ema_series(closes, 26)
+        dif_s = ema12_s - ema26_s
+        dea_s = ema_series(dif_s, 9)
+
+        macd_line = float(dif_s[-1])
+        signal_line = float(dea_s[-1])
         histogram = macd_line - signal_line
         return macd_line, signal_line, histogram
 
