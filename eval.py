@@ -28,6 +28,13 @@ from calc import RiskManager, get_trade_signal, Signal
 # 导入市场情绪分析
 from market_sentiment import get_market_sentiment, get_position_limit
 
+# 导入行业 Alpha 因子（可选）
+try:
+    from industry_alpha import IndustryAlphaCalculator, get_industry_alpha_rotation
+    INDUSTRY_ALPHA_AVAILABLE = True
+except ImportError:
+    INDUSTRY_ALPHA_AVAILABLE = False
+
 # 输出文件路径
 OUTPUT_FILE = Path(__file__).parent / "eval_output.txt"
 
@@ -38,8 +45,8 @@ TABLE_NAME = "stock_daily"
 # ==================== 回测参数配置（可修改） ====================
 
 # 回测时间范围
-START_DATE = "2023-06-01"    # 回测开始日期 (YYYY-MM-DD)
-END_DATE = "2024-06-01"      # 回测结束日期 (YYYY-MM-DD)
+START_DATE = "2024-01-01"    # 回测开始日期 (YYYY-MM-DD)
+END_DATE = "2025-01-01"      # 回测结束日期 (YYYY-MM-DD)
 
 # 股票池（从 const.py 导入，也可在此覆盖）
 # 如果 STOCK_LIST 为空，则自动获取全部股票
@@ -62,6 +69,10 @@ INITIAL_CASH = INITIAL_CAPITAL
 
 # 每只股票最大持仓比例（相对于总资金）
 MAX_STOCK_POSITION = 0.2     # 单只股票最多占用 20% 资金
+
+# 行业 Alpha 因子开关
+USE_INDUSTRY_ALPHA = True    # 是否启用行业 Alpha 因子增强
+INDUSTRY_ALPHA_WEIGHT = 0.25  # 行业 Alpha 因子权重 (0-1)
 
 # ==================== 回测类定义 ====================
 
@@ -129,6 +140,18 @@ class MultiStockBacktestEngine:
         self.enable_market_sentiment = enable_market_sentiment
         self.current_position_limit = 1.0  # 当前仓位上限（根据市场情绪动态调整）
         self.sentiment_history: Dict[str, Dict] = {}  # 记录每日情绪
+
+        # 行业 Alpha 因子
+        self.use_industry_alpha = USE_INDUSTRY_ALPHA and INDUSTRY_ALPHA_AVAILABLE
+        self.industry_alpha_calculator = None
+        self.industry_alpha_cache: Dict[str, Dict] = {}  # 日期 -> 行业Alpha数据
+        if self.use_industry_alpha:
+            try:
+                self.industry_alpha_calculator = IndustryAlphaCalculator()
+                print(f"行业 Alpha 因子已启用 (权重: {INDUSTRY_ALPHA_WEIGHT})")
+            except Exception as e:
+                print(f"行业 Alpha 因子初始化失败: {e}")
+                self.use_industry_alpha = False
 
     def get_stock_name(self, code: str) -> str:
         """获取股票名称"""
@@ -269,16 +292,13 @@ class MultiStockBacktestEngine:
                 signal_info = self._calculate_single_signal_static(args)
                 signals.append(signal_info)
         else:
-            # 使用多进程并行计算
-            self.print_and_write(f"  使用 {workers} 个进程并行计算 {len(args_list)} 只股票...")
-            
+            # 使用多进程并行计算（静默模式，不输出进度）
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 future_to_code = {
                     executor.submit(self._calculate_single_signal_static, args): args[0] 
                     for args in args_list
                 }
                 
-                completed = 0
                 for future in as_completed(future_to_code):
                     code = future_to_code[future]
                     try:
@@ -294,10 +314,6 @@ class MultiStockBacktestEngine:
                             'score': 0,
                             'price': daily_prices[code]
                         })
-                    
-                    completed += 1
-                    if completed % 100 == 0:
-                        self.print_and_write(f"    已完成 {completed}/{len(args_list)}...")
         
         return signals
 
@@ -383,14 +399,31 @@ class MultiStockBacktestEngine:
 
     def generate_signal(self, code: str, date: str, price: float) -> Tuple[str, int, str]:
         """
-        使用 calc.py 的多因子策略生成信号（含风控）
+        使用 calc.py 的多因子策略生成信号（含风控和行业Alpha）
         返回: (信号类型, 建议股数, 交易依据)
         """
         position = self.positions[code]
-        
+
+        # 准备行业 Alpha 因子参数
+        industry_alpha_score = 0.0
+        industry_rank = 999
+        use_alpha = False
+
+        if self.use_industry_alpha and self.industry_alpha_calculator:
+            try:
+                # 获取该股票所属行业的 Alpha 数据
+                stock_alpha = self.industry_alpha_calculator.calculate_stock_alpha_in_industry(code, date)
+                if stock_alpha:
+                    industry_alpha_score = stock_alpha.industry_alpha
+                    industry_rank = stock_alpha.industry_rank
+                    use_alpha = True
+            except Exception as e:
+                # 获取失败时不使用 Alpha 因子
+                pass
+
         try:
             # 使用 calc.py 的 get_trade_signal 函数获取交易决策
-            # 传入正确的股票数据库配置
+            # 传入正确的股票数据库配置和行业 Alpha 因子
             decision, _, _ = get_trade_signal(
                 code=code,
                 date=date,
@@ -404,14 +437,17 @@ class MultiStockBacktestEngine:
                 highest_price=position.highest_price if position.shares > 0 else price,
                 hold_days=position.hold_days if position.shares > 0 else 0,
                 db_path=DB_PATH,           # 使用 eval.py 的数据库路径
-                table_name=TABLE_NAME       # 使用 eval.py 的表名
+                table_name=TABLE_NAME,      # 使用 eval.py 的表名
+                industry_alpha_score=industry_alpha_score,
+                industry_rank=industry_rank,
+                use_industry_alpha=use_alpha
             )
-            
+
             # 将 Signal 枚举转换为字符串
             signal_str = decision.signal.value
-            
+
             return signal_str, decision.shares, decision.reason
-            
+
         except Exception as e:
             # 数据不足或其他错误时返回 HOLD
             return "HOLD", 0, f"信号生成失败: {str(e)}"
@@ -630,8 +666,22 @@ class MultiStockBacktestEngine:
             self.print_and_write(f"  情绪得分: {sentiment.get('score', 0):.2f}")
             self.print_and_write(f"  仓位限制: {sentiment.get('position_ratio', 1.0)*100:.0f}%")
             self.print_and_write(f"  情绪描述: {sentiment.get('description', 'N/A')}")
-            self.print_and_write(f"  ETF状态: MA20上方{sentiment.get('above_ma20_count', 0)}/{sentiment.get('total_etfs', 5)}, "
-                               f"趋势向上{sentiment.get('up_trend_count', 0)}/{sentiment.get('total_etfs', 5)}")
+            self.print_and_write(f"  ETF状态: MA5上方{sentiment.get('above_ma5_count', 0)}/{sentiment.get('total_etfs', 5)}, "
+                               f"MA20上方{sentiment.get('above_ma20_count', 0)}/{sentiment.get('total_etfs', 5)}, "
+                               f"趋势向上{sentiment.get('up_trend_count', 0)}/{sentiment.get('total_etfs', 5)}, "
+                               f"MA20拐头{sentiment.get('ma20_rising_count', 0)}/{sentiment.get('total_etfs', 5)}")
+
+        # 显示行业 Alpha 信息（如果启用）
+        if self.use_industry_alpha and self.industry_alpha_calculator:
+            try:
+                alpha_signal = self.industry_alpha_calculator.get_industry_alpha_signal(record.date)
+                if alpha_signal:
+                    self.print_and_write(f"\n【行业Alpha】")
+                    self.print_and_write(f"  市场信号: {alpha_signal.get('market_signal', 'N/A')}")
+                    self.print_and_write(f"  推荐行业: {', '.join(alpha_signal.get('top_industries', [])[:3])}")
+                    self.print_and_write(f"  回避行业: {', '.join(alpha_signal.get('avoid_industries', [])[:3])}")
+            except Exception as e:
+                pass  # 获取失败时静默处理
 
         # 打印持仓详情（只显示有持仓的股票）
         self.print_and_write(f"\n【持仓详情】")
@@ -899,7 +949,7 @@ def main():
         trail_stop_pct=0.10,     # 10%移动止损
         atr_multiplier=2.0,      # ATR止损倍数
         time_stop_days=10,       # 10天时间止损
-        max_position=0.2,        # 单只股票最大仓位20%
+        max_position=0.1,        # 单只股票最大仓位10%（降低集中度）
         max_total_position=0.8   # 总最大仓位80%
     )
 

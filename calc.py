@@ -30,7 +30,8 @@ DEFAULT_SINGLE_TRADE_RATIO = 0.2   # 单次交易占总资金比例
 DEFAULT_STOP_LOSS_PCT = 0.05       # 固定止损比例 (5%)
 DEFAULT_TRAIL_STOP_PCT = 0.10      # 移动止损比例 (10%)
 DEFAULT_ATR_MULTIPLIER = 2.0       # ATR止损倍数
-DEFAULT_TIME_STOP_DAYS = 10        # 时间止损天数
+DEFAULT_TIME_STOP_DAYS = 5         # 时间止损天数（缩短至5天，提高资金效率）
+DEFAULT_TAKE_PROFIT_PCT = 0.15     # 止盈比例 (15%)
 
 
 class RiskManager:
@@ -109,6 +110,40 @@ class RiskManager:
         if hold_days >= self.time_stop_days and current_price <= entry_price:
             return True, f"时间止损 (持仓{hold_days}天未盈利)"
 
+        return False, ""
+
+    def should_take_profit(
+        self,
+        entry_price: float,
+        current_price: float,
+        highest_price: float,
+        hold_days: int = 0
+    ) -> Tuple[bool, str]:
+        """
+        检查是否触发止盈
+        
+        参数:
+            entry_price: 入场价格
+            current_price: 当前价格
+            highest_price: 持仓期间最高价
+            hold_days: 持仓天数
+            
+        返回:
+            (是否止盈, 止盈原因)
+        """
+        profit_pct = (current_price - entry_price) / entry_price
+        
+        # 1. 固定止盈：盈利超过15%且从高点回落5%时止盈
+        if profit_pct >= DEFAULT_TAKE_PROFIT_PCT:
+            if highest_price > entry_price:
+                drawdown_pct = (highest_price - current_price) / highest_price
+                if drawdown_pct >= 0.05:  # 从高点回落5%
+                    return True, f"止盈 (盈利{profit_pct*100:.1f}%, 回撤{drawdown_pct*100:.1f}%)"
+        
+        # 2. 时间止盈：持仓超过20天且盈利超过10%时止盈
+        if hold_days >= 20 and profit_pct >= 0.10:
+            return True, f"时间止盈 (持仓{hold_days}天, 盈利{profit_pct*100:.1f}%)"
+        
         return False, ""
 
     def calculate_position_size(
@@ -423,15 +458,52 @@ class Strategy:
             "trend_short": trend_short * 0.15,
             "trend_mid": trend_mid * 0.20,
             "trend_long": trend_long * 0.10,
-            "rsi": rsi_signal * 0.20,
-            "macd": macd_signal * 0.15,
-            "bollinger": bb_signal * 0.10,
+            "rsi": rsi_signal * 0.15,
+            "macd": macd_signal * 0.10,
+            "bollinger": bb_signal * 0.08,
             "volume": vol_signal * 0.05,
             "volatility": vol_adj * 0.03,
-            "momentum": momentum_signal * 0.02,
+            "momentum": momentum_signal * 0.04,
+            "industry_alpha": 0.0,  # 将由外部注入行业 Alpha 因子
         }
 
         return self.signals
+
+    def apply_industry_alpha(self, industry_alpha_score: float, industry_rank: int):
+        """
+        应用行业 Alpha 因子到综合得分
+
+        参数:
+            industry_alpha_score: 行业 Alpha 得分 (-1 到 1)
+            industry_rank: 行业排名 (1-5为推荐行业)
+        """
+        # 行业 Alpha 权重 10%
+        alpha_weight = 0.10
+
+        # 排名越靠前，Alpha 因子得分越高
+        if industry_rank <= 3:
+            rank_multiplier = 1.0
+        elif industry_rank <= 5:
+            rank_multiplier = 0.5
+        else:
+            rank_multiplier = -0.5  # 排名靠后的行业扣分
+
+        self.signals["industry_alpha"] = industry_alpha_score * alpha_weight * rank_multiplier
+
+    def get_industry_boost_factor(self, industry_rank: int) -> float:
+        """
+        获取行业排名带来的选股 boost 因子
+
+        用于在选股时优先选择强势行业中的股票
+        """
+        if industry_rank <= 3:
+            return 1.2  # 前3名行业，得分提升20%
+        elif industry_rank <= 5:
+            return 1.1  # 前5名行业，得分提升10%
+        elif industry_rank <= 10:
+            return 1.0  # 正常
+        else:
+            return 0.8  # 排名靠后的行业，得分降低20%
 
     def get_composite_score(self) -> float:
         """获取综合得分 (-1 到 1)"""
@@ -476,6 +548,27 @@ class Strategy:
                 )
                 reason = f"【止损】{stop_reason}, 综合得分: {score:+.3f}"
                 confidence = 0.9  # 止损信号置信度高
+                return TradeDecision(Signal.SELL, shares, reason, confidence)
+
+        # ========== 止盈判断 ==========
+        if current_hold > 0 and entry_price > 0:
+            should_take_profit, profit_reason = self.risk_manager.should_take_profit(
+                entry_price=entry_price,
+                current_price=self.current_price,
+                highest_price=highest_price if highest_price > 0 else self.current_price,
+                hold_days=hold_days
+            )
+            
+            if should_take_profit:
+                # 触发止盈，卖出
+                shares = self.risk_manager.calculate_sell_shares(
+                    current_hold=current_hold,
+                    entry_price=entry_price,
+                    current_price=self.current_price,
+                    force_full=True
+                )
+                reason = f"【止盈】{profit_reason}, 综合得分: {score:+.3f}"
+                confidence = 0.9
                 return TradeDecision(Signal.SELL, shares, reason, confidence)
 
         # ========== 正常信号生成 ==========
@@ -611,7 +704,10 @@ def get_trade_signal(code: str, date: str, hold: int,
                      highest_price: float = 0,
                      hold_days: int = 0,
                      db_path: str = None,
-                     table_name: str = None) -> Tuple[TradeDecision, List[MarketData], float]:
+                     table_name: str = None,
+                     industry_alpha_score: float = 0.0,
+                     industry_rank: int = 999,
+                     use_industry_alpha: bool = False) -> Tuple[TradeDecision, List[MarketData], float]:
     """
     获取交易信号（供回测脚本调用）
 
@@ -629,6 +725,9 @@ def get_trade_signal(code: str, date: str, hold: int,
         hold_days: 持仓天数 (可选，用于时间止损)
         db_path: 数据库路径 (可选，默认使用股票数据库)
         table_name: 表名 (可选，默认使用stock_daily)
+        industry_alpha_score: 行业 Alpha 得分 (可选)
+        industry_rank: 行业排名 (可选)
+        use_industry_alpha: 是否使用行业 Alpha 因子 (可选)
 
     返回:
         (交易决策, 历史数据列表, 当前价格)
@@ -645,7 +744,17 @@ def get_trade_signal(code: str, date: str, hold: int,
     # 计算因子并生成信号
     strategy = Strategy(data, current_price, initial_capital, max_position, 
                         min_position, single_trade_ratio, risk_manager)
+
+    # 应用行业 Alpha 因子
+    if use_industry_alpha and industry_alpha_score != 0.0:
+        strategy.apply_industry_alpha(industry_alpha_score, industry_rank)
+
     decision = strategy.generate_signal(hold, entry_price, highest_price, hold_days)
+
+    # 如果启用了行业 Alpha，在理由中追加信息
+    if use_industry_alpha and industry_rank <= 10:
+        industry_tag = f"[行业排名{industry_rank}]"
+        decision.reason = f"{industry_tag} {decision.reason}"
 
     return decision, data, current_price
 
