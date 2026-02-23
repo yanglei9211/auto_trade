@@ -19,7 +19,7 @@ from multiprocessing import cpu_count
 from const import (
     STOCK_LIST, INITIAL_CAPITAL, MAX_POSITION, MIN_POSITION,
     SINGLE_TRADE_RATIO, COMMISSION_RATE, STAMP_TAX_RATE, MIN_TRADE_UNIT,
-    STOCK_DB_PATH, get_full_stock, MAX_WORKERS
+    STOCK_DB_PATH, get_full_stock, MAX_WORKERS,USE_INDUSTRY_ALPHA,INDUSTRY_ALPHA_WEIGHT
 )
 
 # 导入 calc.py 的风险管理和信号生成功能
@@ -86,9 +86,7 @@ INITIAL_CASH = INITIAL_CAPITAL
 # 每只股票最大持仓比例（相对于总资金）
 MAX_STOCK_POSITION = 0.2     # 单只股票最多占用 20% 资金
 
-# 行业 Alpha 因子开关
-USE_INDUSTRY_ALPHA = True    # 是否启用行业 Alpha 因子增强
-INDUSTRY_ALPHA_WEIGHT = 0.25  # 行业 Alpha 因子权重 (0-1)
+
 
 # ==================== 回测类定义 ====================
 
@@ -456,7 +454,8 @@ class MultiStockBacktestEngine:
                 table_name=TABLE_NAME,      # 使用 eval.py 的表名
                 industry_alpha_score=industry_alpha_score,
                 industry_rank=industry_rank,
-                use_industry_alpha=use_alpha
+                use_industry_alpha=use_alpha,
+                industry_alpha_weight=INDUSTRY_ALPHA_WEIGHT
             )
 
             # 将 Signal 枚举转换为字符串

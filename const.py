@@ -67,9 +67,6 @@ DEFAULT_END_DATE = "20260213"
 # SQLite 数据库基础目录
 DB_BASE_PATH = "/Users/yanglei/Documents/sqlite/sqlite-data"
 
-# ETF 数据库路径
-ETF_DB_PATH = f"{DB_BASE_PATH}/etf_data.db"
-
 # 股票数据库路径
 STOCK_DB_PATH = f"{DB_BASE_PATH}/stock_data.db"
 
@@ -88,7 +85,9 @@ SINGLE_TRADE_RATIO = 0.2
 
 # 佣金率
 COMMISSION_RATE = 0.0003
-
+# 行业 Alpha 因子开关
+USE_INDUSTRY_ALPHA = True    # 是否启用行业 Alpha 因子增强
+INDUSTRY_ALPHA_WEIGHT = 0.25  # 行业 Alpha 因子权重 (0-1)
 # 印花税率
 STAMP_TAX_RATE = 0.001
 

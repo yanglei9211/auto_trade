@@ -488,7 +488,7 @@ class Strategy:
 
         return self.signals
 
-    def apply_industry_alpha(self, industry_alpha_score: float, industry_rank: int):
+    def apply_industry_alpha(self, industry_alpha_score: float, industry_rank: int, alpha_weight: float = 0.10):
         """
         应用行业 Alpha 因子到综合得分
 
@@ -726,7 +726,8 @@ def get_trade_signal(code: str, date: str, hold: int,
                      table_name: str = None,
                      industry_alpha_score: float = 0.0,
                      industry_rank: int = 999,
-                     use_industry_alpha: bool = False) -> Tuple[TradeDecision, List[MarketData], float]:
+                     use_industry_alpha: bool = False,
+                     industry_alpha_weight: float = 0.10) -> Tuple[TradeDecision, List[MarketData], float]:
     """
     获取交易信号（供回测脚本调用）
 
@@ -766,7 +767,7 @@ def get_trade_signal(code: str, date: str, hold: int,
 
     # 应用行业 Alpha 因子
     if use_industry_alpha and industry_alpha_score != 0.0:
-        strategy.apply_industry_alpha(industry_alpha_score, industry_rank)
+        strategy.apply_industry_alpha(industry_alpha_score, industry_rank, alpha_weight=industry_alpha_weight)
 
     decision = strategy.generate_signal(hold, entry_price, highest_price, hold_days)
 
