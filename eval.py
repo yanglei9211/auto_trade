@@ -183,8 +183,12 @@ class MultiStockBacktestEngine:
         self.positions: Dict[str, StockPosition] = {code: StockPosition(code) for code in stock_pool}
         self.records: List[DailyRecord] = []
         self.trade_count = 0
-        self.daily_prices: Dict[str, Dict[str, float]] = {}  # date -> {code: price}
-        self.last_price: Dict[str, float] = {}               # code -> last known close (carry-forward for停牌/缺失)
+        # 价格体系拆分：
+        # - daily_prices_raw：DB里真实存在的行情（用于信号生成/可交易判断）
+        # - daily_prices_ffill：在 raw 基础上做前值填充（仅用于估值/打印，避免停牌/缺失导致市值归零）
+        self.daily_prices_raw: Dict[str, Dict[str, float]] = {}    # date -> {code: close}
+        self.daily_prices_ffill: Dict[str, Dict[str, float]] = {}  # date -> {code: close (ffill)}
+        self.last_price: Dict[str, float] = {}                     # code -> last known close
         self.code_name_map = code_name_map or {}  # 代码到名称的映射
         self.output_file = None  # 输出文件句柄
         
@@ -434,22 +438,22 @@ class MultiStockBacktestEngine:
             for row in cursor.fetchall():
                 date = row["date"]
                 price = row["close"]
-                if date not in self.daily_prices:
-                    self.daily_prices[date] = {}
-                self.daily_prices[date][code] = price
+                if date not in self.daily_prices_raw:
+                    self.daily_prices_raw[date] = {}
+                self.daily_prices_raw[date][code] = price
 
-        # 对缺失行情做“前值填充”（carry-forward）：
-        # - 解决停牌/数据缺口导致的 price=0 -> 市值归零 -> -100% 假象
-        # - 仅用于估值/打印；信号计算仍基于当日是否有价格（无价格则不会进入 daily_prices）
+        # 构建估值用价格：对 raw 做前值填充（carry-forward）
         last = {}
-        for d in sorted(self.daily_prices.keys()):
-            day_map = self.daily_prices[d]
+        for d in sorted(self.daily_prices_raw.keys()):
+            raw_map = self.daily_prices_raw[d]
+            out_map = {}
             for c in self.stock_pool:
-                if c in day_map and day_map[c] is not None:
-                    last[c] = float(day_map[c])
+                if c in raw_map and raw_map[c] is not None:
+                    last[c] = float(raw_map[c])
+                    out_map[c] = last[c]
                 elif c in last:
-                    # 仅填充缺失的 code
-                    day_map.setdefault(c, last[c])
+                    out_map[c] = last[c]
+            self.daily_prices_ffill[d] = out_map
         self.last_price = last
 
         conn.close()
@@ -669,8 +673,10 @@ class MultiStockBacktestEngine:
         self.print_and_write(f"{'='*100}\n")
 
         for date in trading_days:
-            daily_prices = self.daily_prices.get(date, {})
-            if not daily_prices:
+            # raw 用于信号/交易；ffill 用于估值/打印
+            daily_prices_raw = self.daily_prices_raw.get(date, {})
+            daily_prices = self.daily_prices_ffill.get(date, {})
+            if not daily_prices_raw:
                 continue
 
             daily_trades = []
@@ -682,13 +688,14 @@ class MultiStockBacktestEngine:
             current_position_ratio = self.get_current_total_position_ratio(daily_prices)
 
             # 更新所有持仓的最高价和持仓天数（用于移动止损和时间止损）
+            # 使用 raw 价格：停牌/缺失数据日不更新 highest/hold_days
             for code, position in self.positions.items():
-                if position.shares > 0 and code in daily_prices:
-                    position.update_highest_price(daily_prices[code])
+                if position.shares > 0 and code in daily_prices_raw:
+                    position.update_highest_price(daily_prices_raw[code])
                     position.increment_hold_days()
 
-            # 并行计算所有股票的信号和评分
-            signals = self._calculate_signals_parallel(date, daily_prices)
+            # 并行计算所有股票的信号和评分（仅对 raw 有行情的股票计算）
+            signals = self._calculate_signals_parallel(date, daily_prices_raw)
             
             # 按评分排序：卖出信号优先（止损），然后按买入评分降序
             sorted_signals = self._sort_signals_by_priority(signals)
@@ -700,7 +707,10 @@ class MultiStockBacktestEngine:
                 shares = signal_info['shares']
                 reason = signal_info['reason']
                 score = signal_info['score']
-                price = daily_prices[code]
+                # 交易撮合用 raw 价格（真实可成交价格）；估值用 ffill
+                price = daily_prices_raw.get(code)
+                if price is None:
+                    continue
 
                 # 统计：过滤拦截（generate_signal 返回 HOLD 且 reason 里带过滤）
                 if signal == "HOLD" and isinstance(reason, str) and reason.startswith("不可交易池过滤"):
