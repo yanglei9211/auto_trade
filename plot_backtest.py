@@ -337,8 +337,10 @@ def main():
             print(f"  中证500: {returns['zz500']:+.2f}%")
             print(f"  超额收益(中证500): {total_return - returns['zz500']:+.2f}%")
     
-    # 保存图表
-    output_path = script_dir / "backtest_comparison.png"
+    # 保存图表（带时间戳，避免覆盖）
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = script_dir / f"backtest_comparison_{timestamp}.png"
     plot_comparison(backtest_data, index_data_dict, initial_value, str(output_path))
 
 

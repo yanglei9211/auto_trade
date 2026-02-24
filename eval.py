@@ -49,8 +49,8 @@ TABLE_NAME = "stock_daily"
 # ==================== 回测参数配置（可修改） ====================
 
 # 回测时间范围
-START_DATE = "2023-01-01"    # 回测开始日期 (YYYY-MM-DD)
-END_DATE = "2026-02-13"      # 回测结束日期 (YYYY-MM-DD)
+START_DATE = "2024-01-01"    # 回测开始日期 (YYYY-MM-DD)
+END_DATE = "2024-06-01"      # 回测结束日期 (YYYY-MM-DD)
 
 # 股票池（从 const.py 导入，也可在此覆盖）
 # 如果 STOCK_LIST 为空，则自动获取全部股票
