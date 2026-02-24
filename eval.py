@@ -50,7 +50,7 @@ TABLE_NAME = "stock_daily"
 
 # 回测时间范围
 START_DATE = "2023-01-01"    # 回测开始日期 (YYYY-MM-DD)
-END_DATE = "2025-02-13"      # 回测结束日期 (YYYY-MM-DD)
+END_DATE = "2026-02-13"      # 回测结束日期 (YYYY-MM-DD)
 
 # 股票池（从 const.py 导入，也可在此覆盖）
 # 如果 STOCK_LIST 为空，则自动获取全部股票
@@ -1018,7 +1018,8 @@ def main():
 
     # 创建风险管理器（可根据需要调整参数）
     risk_manager = RiskManager(
-        stop_loss_pct=0.05,      # 5%固定止损
+        # 已改为 ATR/波动自适应止损：min_stop_loss_pct 仅作为“最小止损宽度”下限
+        min_stop_loss_pct=0.10,  # 最小止损宽度下限（10%）
         trail_stop_pct=0.10,     # 10%移动止损
         atr_multiplier=2.0,      # ATR止损倍数
         time_stop_days=10,       # 10天时间止损
