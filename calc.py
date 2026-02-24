@@ -27,7 +27,9 @@ DEFAULT_MIN_POSITION = 0.0        # 最小仓位比例
 DEFAULT_SINGLE_TRADE_RATIO = 0.2   # 单次交易占总资金比例
 
 # 默认止损参数
-DEFAULT_STOP_LOSS_PCT = 0.05       # 固定止损比例 (5%)
+# 说明：止损优先使用“ATR自适应止损”（entry - ATR_MULTIPLIER * ATR）。
+# 为防止 ATR 异常偏小导致止损过紧，增加一个“最小止损比例”下限。
+DEFAULT_MIN_STOP_LOSS_PCT = 0.10   # 最小止损比例下限 (10%)
 DEFAULT_TRAIL_STOP_PCT = 0.10      # 移动止损比例 (10%)
 DEFAULT_ATR_MULTIPLIER = 2.0       # ATR止损倍数
 DEFAULT_TIME_STOP_DAYS = 5         # 时间止损天数（缩短至5天，提高资金效率）
@@ -43,7 +45,7 @@ class RiskManager:
 
     def __init__(
         self,
-        stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
+        min_stop_loss_pct: float = DEFAULT_MIN_STOP_LOSS_PCT,
         trail_stop_pct: float = DEFAULT_TRAIL_STOP_PCT,
         atr_multiplier: float = DEFAULT_ATR_MULTIPLIER,
         time_stop_days: int = DEFAULT_TIME_STOP_DAYS,
@@ -54,14 +56,14 @@ class RiskManager:
         初始化风险管理器
         
         参数:
-            stop_loss_pct: 固定止损比例 (如 0.05 表示亏损5%止损)
+            min_stop_loss_pct: 最小止损比例下限 (如 0.05 表示至少允许亏损5%再止损；防止ATR过小)
             trail_stop_pct: 移动止损比例 (如 0.10 表示从最高点回落10%止损)
             atr_multiplier: ATR止损倍数
             time_stop_days: 时间止损天数 (持仓N天未盈利则卖出)
             max_position: 单只股票最大仓位比例
             max_total_position: 总最大仓位比例
         """
-        self.stop_loss_pct = stop_loss_pct
+        self.min_stop_loss_pct = min_stop_loss_pct
         self.trail_stop_pct = trail_stop_pct
         self.atr_multiplier = atr_multiplier
         self.time_stop_days = time_stop_days
@@ -89,24 +91,30 @@ class RiskManager:
         返回:
             (是否止损, 止损原因)
         """
-        # 1. 固定止损
         loss_pct = (entry_price - current_price) / entry_price
-        if loss_pct >= self.stop_loss_pct:
-            return True, f"固定止损 ({loss_pct*100:.1f}%)"
 
-        # 2. 移动止损 (保护利润)
+        # 1) ATR/波动自适应止损（主止损）
+        # 目标：替代“固定5%”成为默认止损逻辑。
+        # - ATR > 0 时：止损价 = entry - k * ATR
+        # - 但 ATR 可能异常偏小（或数据不足导致为0），因此设置最小止损比例下限。
+        if atr > 0:
+            atr_stop_price = entry_price - self.atr_multiplier * atr
+            min_pct_stop_price = entry_price * (1 - self.min_stop_loss_pct)
+            stop_price = min(atr_stop_price, min_pct_stop_price)  # 价格更低 => 止损更宽松
+            if current_price < stop_price:
+                return True, f"ATR自适应止损 (stop={stop_price:.2f}, ATR={atr:.2f})"
+
+        # 2) 兜底：若 ATR 不可用，则使用最小止损比例下限
+        if atr <= 0 and loss_pct >= self.min_stop_loss_pct:
+            return True, f"止损(兜底{self.min_stop_loss_pct*100:.1f}%)"
+
+        # 3) 移动止损 (保护利润)
         if highest_price > entry_price:
             drawdown_pct = (highest_price - current_price) / highest_price
             if drawdown_pct >= self.trail_stop_pct:
                 return True, f"移动止损 (回撤{drawdown_pct*100:.1f}%)"
 
-        # 3. ATR自适应止损
-        if atr > 0:
-            atr_stop_price = entry_price - self.atr_multiplier * atr
-            if current_price < atr_stop_price:
-                return True, f"ATR止损 (跌破{atr_stop_price:.2f})"
-
-        # 4. 时间止损
+        # 4) 时间止损
         if hold_days >= self.time_stop_days and current_price <= entry_price:
             return True, f"时间止损 (持仓{hold_days}天未盈利)"
 
