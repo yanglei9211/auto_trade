@@ -74,6 +74,12 @@ STOCK_DB_PATH = f"{DB_BASE_PATH}/stock_data.db"
 # 初始资金 (RMB)
 INITIAL_CAPITAL = 100000
 
+# ==================== 可交易池过滤（默认启用）====================
+# 近20日成交额均值阈值（单位：元）。例如 5000万 = 50_000_000。
+LIQUIDITY_MIN_AVG_AMOUNT_20D = 50_000_000
+# 次新过滤：上市天数小于该值不交易
+MIN_LISTING_DAYS = 60
+
 # 最大仓位比例
 MAX_POSITION = 0.95
 

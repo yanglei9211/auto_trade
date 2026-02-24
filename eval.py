@@ -19,8 +19,12 @@ from multiprocessing import cpu_count
 from const import (
     STOCK_LIST, INITIAL_CAPITAL, MAX_POSITION, MIN_POSITION,
     SINGLE_TRADE_RATIO, COMMISSION_RATE, STAMP_TAX_RATE, MIN_TRADE_UNIT,
-    STOCK_DB_PATH, get_full_stock, MAX_WORKERS,USE_INDUSTRY_ALPHA,INDUSTRY_ALPHA_WEIGHT
+    STOCK_DB_PATH, get_full_stock, MAX_WORKERS,
+    USE_INDUSTRY_ALPHA, INDUSTRY_ALPHA_WEIGHT,
+    LIQUIDITY_MIN_AVG_AMOUNT_20D, MIN_LISTING_DAYS,
 )
+
+from tradable_filter import TradableFilterConfig, check_tradable
 
 # 导入 calc.py 的风险管理和信号生成功能
 from calc import RiskManager, get_trade_signal, Signal
@@ -417,6 +421,24 @@ class MultiStockBacktestEngine:
         返回: (信号类型, 建议股数, 交易依据)
         """
         position = self.positions[code]
+
+        # ========== 可交易池过滤（仅影响 BUY；SELL 一律放行以便退出） ==========
+        try:
+            cfg = TradableFilterConfig(
+                amount_window=20,
+                min_avg_amount=LIQUIDITY_MIN_AVG_AMOUNT_20D,
+                min_listing_days=MIN_LISTING_DAYS,
+            )
+            with sqlite3.connect(DB_PATH) as conn:
+                tr = check_tradable(conn, code, date, cfg)
+            if not tr.tradable:
+                # 不允许开新仓/加仓，但允许继续走到后面生成 SELL（止损/止盈/趋势退出）
+                # 这里采取“先看当前是否持仓”：
+                if position.shares <= 0:
+                    return "HOLD", 0, f"不可交易池过滤: {tr.reason}"
+        except Exception as e:
+            # 过滤异常时不阻断交易信号（保守：让策略继续跑）
+            pass
 
         # 准备行业 Alpha 因子参数
         industry_alpha_score = 0.0
