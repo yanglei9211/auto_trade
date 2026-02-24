@@ -85,7 +85,7 @@ class RiskManager:
         score: float = 0.0,
         time_stop_requires_weak_score: bool = True,
         time_stop_score_threshold: float = 0.0,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, bool]:
         """
         检查是否触发止损
         
@@ -100,7 +100,7 @@ class RiskManager:
             time_stop_score_threshold: score 阈值（默认 0.0，表示 score<=0 才触发时间止损）
 
         返回:
-            (是否止损, 止损原因)
+            (是否止损, 止损原因, 是否强制全卖)
         """
         loss_pct = (entry_price - current_price) / entry_price
 
@@ -113,24 +113,28 @@ class RiskManager:
             min_pct_stop_price = entry_price * (1 - self.min_stop_loss_pct)
             stop_price = min(atr_stop_price, min_pct_stop_price)  # 价格更低 => 止损更宽松
             if current_price < stop_price:
-                return True, f"ATR自适应止损 (stop={stop_price:.2f}, ATR={atr:.2f})"
+                # 硬止损：破位则全清
+                return True, f"ATR自适应止损 (stop={stop_price:.2f}, ATR={atr:.2f})", True
 
         # 2) 兜底：若 ATR 不可用，则使用最小止损比例下限
         if atr <= 0 and loss_pct >= self.min_stop_loss_pct:
-            return True, f"止损(兜底{self.min_stop_loss_pct*100:.1f}%)"
+            # 硬止损：无法计算ATR时的兜底，同样全清
+            return True, f"止损(兜底{self.min_stop_loss_pct*100:.1f}%)", True
 
         # 3) 移动止损 (保护利润)
         if highest_price > entry_price:
             drawdown_pct = (highest_price - current_price) / highest_price
             if drawdown_pct >= self.trail_stop_pct:
-                return True, f"移动止损 (回撤{drawdown_pct*100:.1f}%)"
+                # 硬止损：移动止损触发一般也全清（防利润回吐）
+                return True, f"移动止损 (回撤{drawdown_pct*100:.1f}%)", True
 
         # 4) 时间止损（方案A：仅在“得分偏弱/趋势不佳”时触发，避免震荡市被频繁洗出）
         if hold_days >= self.time_stop_days and current_price <= entry_price:
             if (not time_stop_requires_weak_score) or (score <= time_stop_score_threshold):
-                return True, f"时间止损 (持仓{hold_days}天未盈利, score={score:+.3f})"
+                # 软止损：时间止损只减仓，不全清（避免震荡磨损右尾）
+                return True, f"时间止损 (持仓{hold_days}天未盈利, score={score:+.3f})", False
 
-        return False, ""
+        return False, "", False
 
     def should_take_profit(
         self,
@@ -236,14 +240,13 @@ class RiskManager:
         if force_full:
             return current_hold
 
-        # 盈利超过20%可考虑分批卖出
-        profit_pct = (current_price - entry_price) / entry_price
-        if profit_pct > 0.20:
-            return min(current_hold, int(current_hold * 0.5 / 100) * 100)
-        elif profit_pct > 0.10:
-            return min(current_hold, int(current_hold * 0.25 / 100) * 100)
-        else:
+        # 软止损：默认减仓 1/3（手取整），避免一刀切全清
+        sell = int(current_hold * (1/3))
+        sell = int(sell / 100) * 100
+        # 若剩余不足一手，则直接全卖
+        if current_hold - sell < 100:
             return current_hold
+        return max(sell, 100)
 
 
 class Signal(Enum):
@@ -559,7 +562,7 @@ class Strategy:
         # ========== 止损检查 ==========
         if current_hold > 0 and entry_price > 0:
             # 使用风险管理器检查止损
-            should_stop, stop_reason = self.risk_manager.should_stop_loss(
+            should_stop, stop_reason, force_full = self.risk_manager.should_stop_loss(
                 entry_price=entry_price,
                 current_price=self.current_price,
                 highest_price=highest_price if highest_price > 0 else self.current_price,
@@ -569,17 +572,18 @@ class Strategy:
                 time_stop_requires_weak_score=True,
                 time_stop_score_threshold=-0.1,
             )
-            
+
             if should_stop:
-                # 触发止损，强制卖出
+                # 触发止损：硬止损全清；软止损分档减仓
                 shares = self.risk_manager.calculate_sell_shares(
                     current_hold=current_hold,
                     entry_price=entry_price,
                     current_price=self.current_price,
-                    force_full=True
+                    force_full=force_full
                 )
-                reason = f"【止损】{stop_reason}, 综合得分: {score:+.3f}"
-                confidence = 0.9  # 止损信号置信度高
+                tag = "【止损】" if force_full else "【止损-减仓】"
+                reason = f"{tag}{stop_reason}, 综合得分: {score:+.3f}"
+                confidence = 0.9 if force_full else 0.75
                 return TradeDecision(Signal.SELL, shares, reason, confidence)
 
         # ========== 分批止盈（8%卖1/3；15%再卖1/3；剩余交给移动止损/趋势退出） ==========
