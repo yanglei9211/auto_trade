@@ -137,6 +137,41 @@ class DailyRecord:
 class MultiStockBacktestEngine:
     """多股票回测引擎（集成风控和市场情绪）"""
 
+    def _update_event_stats(self, trade: Dict):
+        """按 trade['reason'] 归因统计事件次数/金额。
+
+        关注：止损、分批止盈1/2、止盈(兼容)、普通SELL、过滤拦截。
+        """
+        if not hasattr(self, "event_stats"):
+            self.event_stats = {
+                "STOP_LOSS": 0,
+                "TP1": 0,
+                "TP2": 0,
+                "TAKE_PROFIT_COMPAT": 0,
+                "SELL_OTHER": 0,
+                "BUY": 0,
+                "FILTER_BLOCK": 0,
+            }
+
+        reason = (trade.get("reason") or "").strip()
+        sig = trade.get("signal")
+
+        if sig == "BUY":
+            self.event_stats["BUY"] += 1
+            return
+
+        if sig == "SELL":
+            if "【止损】" in reason:
+                self.event_stats["STOP_LOSS"] += 1
+            elif "【分批止盈1】" in reason:
+                self.event_stats["TP1"] += 1
+            elif "【分批止盈2】" in reason:
+                self.event_stats["TP2"] += 1
+            elif "【止盈(兼容)】" in reason or "止盈(兼容)" in reason:
+                self.event_stats["TAKE_PROFIT_COMPAT"] += 1
+            else:
+                self.event_stats["SELL_OTHER"] += 1
+
     def __init__(self, stock_pool: List[str], start_date: str, end_date: str, initial_cash: float, 
                  code_name_map: Dict[str, str] = None, risk_manager: RiskManager = None,
                  enable_market_sentiment: bool = True):
@@ -652,6 +687,12 @@ class MultiStockBacktestEngine:
                 score = signal_info['score']
                 price = daily_prices[code]
 
+                # 统计：过滤拦截（generate_signal 返回 HOLD 且 reason 里带过滤）
+                if signal == "HOLD" and isinstance(reason, str) and reason.startswith("不可交易池过滤"):
+                    if not hasattr(self, "event_stats"):
+                        self.event_stats = {"STOP_LOSS": 0, "TP1": 0, "TP2": 0, "TAKE_PROFIT_COMPAT": 0, "SELL_OTHER": 0, "BUY": 0, "FILTER_BLOCK": 0}
+                    self.event_stats["FILTER_BLOCK"] += 1
+
                 if signal != "HOLD":
                     # 买入前检查仓位限制
                     if signal == "BUY":
@@ -673,6 +714,10 @@ class MultiStockBacktestEngine:
                                 pos.tp_stage = max(pos.tp_stage, 2)
                         except Exception:
                             pass
+
+                        # 事件统计
+                        self._update_event_stats(trade)
+
                         trade["name"] = self.get_stock_name(code)
                         trade['score'] = score  # 记录评分
                         daily_trades.append(trade)
@@ -950,6 +995,18 @@ class MultiStockBacktestEngine:
         self.print_and_write(f"总印花税:        {total_stamp_tax:>15,.2f} RMB")
         self.print_and_write(f"总交易成本:      {total_commission + total_stamp_tax:>15,.2f} RMB")
         self.print_and_write(f"-" * 60)
+
+        # 事件归因统计（帮助快速定位“差在哪里”）
+        if hasattr(self, "event_stats"):
+            es = self.event_stats
+            self.print_and_write(f"\n【事件归因统计】")
+            self.print_and_write(f"  BUY:                 {es.get('BUY', 0)}")
+            self.print_and_write(f"  STOP_LOSS(全卖):      {es.get('STOP_LOSS', 0)}")
+            self.print_and_write(f"  TP1(8%卖1/3):         {es.get('TP1', 0)}")
+            self.print_and_write(f"  TP2(15%再卖1/3):      {es.get('TP2', 0)}")
+            self.print_and_write(f"  TAKE_PROFIT_COMPAT:   {es.get('TAKE_PROFIT_COMPAT', 0)}")
+            self.print_and_write(f"  SELL_OTHER:           {es.get('SELL_OTHER', 0)}")
+            self.print_and_write(f"  FILTER_BLOCK(HOLD):   {es.get('FILTER_BLOCK', 0)}")
 
         # 打印有交易的股票详情
         if traded_stats:
