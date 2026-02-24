@@ -568,7 +568,7 @@ class Strategy:
                 hold_days=hold_days,
                 score=score,
                 time_stop_requires_weak_score=True,
-                time_stop_score_threshold=0.0,
+                time_stop_score_threshold=-0.1,
             )
             
             if should_stop:
