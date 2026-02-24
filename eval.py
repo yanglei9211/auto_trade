@@ -105,6 +105,7 @@ class StockPosition:
     highest_price: float = 0.0     # 持仓期间最高价（用于移动止损）
     hold_days: int = 0             # 持仓天数
     tp_stage: int = 0              # 分批止盈阶段：0未触发；1已触发8%；2已触发15%
+    sl_stage: int = 0              # 时间止损减仓阶段：0未触发；1已减仓1次；2已减仓2次(封顶)
 
     @property
     def market_value(self, price: float = 0) -> float:
@@ -285,13 +286,13 @@ class MultiStockBacktestEngine:
         
         参数:
             args: (code, date, price, position_shares, position_avg_cost, 
-                   position_highest_price, position_hold_days, tp_stage, initial_cash)
+                   position_highest_price, position_hold_days, tp_stage, sl_stage, initial_cash)
         
         返回:
             信号信息字典
         """
         (code, date, price, position_shares, position_avg_cost,
-         position_highest_price, position_hold_days, tp_stage, initial_cash) = args
+         position_highest_price, position_hold_days, tp_stage, sl_stage, initial_cash) = args
         
         try:
             # 导入必要的模块（在子进程中）
@@ -315,6 +316,7 @@ class MultiStockBacktestEngine:
                 highest_price=position_highest_price if position_shares > 0 else price,
                 hold_days=position_hold_days if position_shares > 0 else 0,
                 tp_stage=tp_stage if position_shares > 0 else 0,
+                sl_stage=sl_stage if position_shares > 0 else 0,
                 db_path=STOCK_DB_PATH,
                 table_name="stock_daily"
             )
@@ -351,6 +353,7 @@ class MultiStockBacktestEngine:
                 position.highest_price,
                 position.hold_days,
                 position.tp_stage,
+                position.sl_stage,
                 self.initial_cash
             )
             args_list.append(args)
@@ -564,6 +567,7 @@ class MultiStockBacktestEngine:
                 highest_price=position.highest_price if position.shares > 0 else price,
                 hold_days=position.hold_days if position.shares > 0 else 0,
                 tp_stage=position.tp_stage if position.shares > 0 else 0,
+                sl_stage=position.sl_stage if position.shares > 0 else 0,
                 db_path=DB_PATH,           # 使用 eval.py 的数据库路径
                 table_name=TABLE_NAME,      # 使用 eval.py 的表名
                 industry_alpha_score=industry_alpha_score,
@@ -628,6 +632,7 @@ class MultiStockBacktestEngine:
                 position.highest_price = price
                 position.hold_days = 0
                 position.tp_stage = 0  # 新开仓重置分批止盈阶段
+                position.sl_stage = 0  # 新开仓重置时间止损减仓阶段
 
             self.cash -= total_cost
             self.trade_count += 1
@@ -656,6 +661,7 @@ class MultiStockBacktestEngine:
                 position.highest_price = 0
                 position.hold_days = 0
                 position.tp_stage = 0
+                position.sl_stage = 0
 
             self.cash += trade_amount - commission - stamp_tax
             self.trade_count += 1
@@ -759,6 +765,10 @@ class MultiStockBacktestEngine:
                                 pos.tp_stage = max(pos.tp_stage, 1)
                             elif "【分批止盈2】" in reason:
                                 pos.tp_stage = max(pos.tp_stage, 2)
+
+                            # 时间止损减仓阶段推进：每次触发+1，封顶2
+                            if "【止损-减仓】" in reason and "时间止损" in reason:
+                                pos.sl_stage = min(pos.sl_stage + 1, 2)
                         except Exception:
                             pass
 

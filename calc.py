@@ -85,6 +85,7 @@ class RiskManager:
         score: float = 0.0,
         time_stop_requires_weak_score: bool = True,
         time_stop_score_threshold: float = 0.0,
+        sl_stage: int = 0,
     ) -> Tuple[bool, str, bool]:
         """
         检查是否触发止损
@@ -98,6 +99,7 @@ class RiskManager:
             score: 策略综合得分（用于时间止损的“弱趋势”判定）
             time_stop_requires_weak_score: 是否要求 score 偏弱才触发时间止损
             time_stop_score_threshold: score 阈值（默认 0.0，表示 score<=0 才触发时间止损）
+            sl_stage: 时间止损减仓阶段（0未触发；1已减仓1次；2已减仓2次(封顶)）
 
         返回:
             (是否止损, 止损原因, 是否强制全卖)
@@ -132,7 +134,9 @@ class RiskManager:
         if hold_days >= self.time_stop_days and current_price <= entry_price:
             if (not time_stop_requires_weak_score) or (score <= time_stop_score_threshold):
                 # 软止损：时间止损只减仓，不全清（避免震荡磨损右尾）
-                return True, f"时间止损 (持仓{hold_days}天未盈利, score={score:+.3f})", False
+                # 方案A：每次开仓最多触发两次（用 sl_stage 控制）
+                if sl_stage < 2:
+                    return True, f"时间止损 (持仓{hold_days}天未盈利, score={score:+.3f}, sl_stage={sl_stage})", False
 
         return False, "", False
 
@@ -543,7 +547,7 @@ class Strategy:
 
     def generate_signal(self, current_hold: int, entry_price: float = 0,
                         highest_price: float = 0, hold_days: int = 0,
-                        tp_stage: int = 0) -> TradeDecision:
+                        tp_stage: int = 0, sl_stage: int = 0) -> TradeDecision:
         """
         生成交易信号 (含风险管理)
         
@@ -553,6 +557,7 @@ class Strategy:
             highest_price: 持仓期间最高价 (可选，用于移动止损)
             hold_days: 持仓天数 (可选，用于时间止损)
             tp_stage: 分批止盈阶段（0未触发；1已触发8%；2已触发15%）
+            sl_stage: 时间止损减仓阶段（0未触发；1已减仓1次；2已减仓2次(封顶)）
 
         返回:
             TradeDecision: 交易决策
@@ -571,6 +576,7 @@ class Strategy:
                 score=score,
                 time_stop_requires_weak_score=True,
                 time_stop_score_threshold=-0.1,
+                sl_stage=sl_stage,
             )
 
             if should_stop:
@@ -763,6 +769,7 @@ def get_trade_signal(code: str, date: str, hold: int,
                      highest_price: float = 0,
                      hold_days: int = 0,
                      tp_stage: int = 0,
+                     sl_stage: int = 0,
                      db_path: str = None,
                      table_name: str = None,
                      industry_alpha_score: float = 0.0,
@@ -790,6 +797,7 @@ def get_trade_signal(code: str, date: str, hold: int,
         industry_rank: 行业排名 (可选)
         use_industry_alpha: 是否使用行业 Alpha 因子 (可选)
         tp_stage: 分批止盈阶段（0未触发；1已触发8%；2已触发15%）
+        sl_stage: 时间止损减仓阶段（0未触发；1已减仓1次；2已减仓2次(封顶)）
 
     返回:
         (交易决策, 历史数据列表, 当前价格)
@@ -811,7 +819,7 @@ def get_trade_signal(code: str, date: str, hold: int,
     if use_industry_alpha and industry_alpha_score != 0.0:
         strategy.apply_industry_alpha(industry_alpha_score, industry_rank, alpha_weight=industry_alpha_weight)
 
-    decision = strategy.generate_signal(hold, entry_price, highest_price, hold_days, tp_stage)
+    decision = strategy.generate_signal(hold, entry_price, highest_price, hold_days, tp_stage, sl_stage)
 
     # 如果启用了行业 Alpha，在理由中追加信息
     if use_industry_alpha and industry_rank <= 10:
