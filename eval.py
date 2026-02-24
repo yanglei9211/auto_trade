@@ -49,8 +49,8 @@ TABLE_NAME = "stock_daily"
 # ==================== 回测参数配置（可修改） ====================
 
 # 回测时间范围
-START_DATE = "2024-01-01"    # 回测开始日期 (YYYY-MM-DD)
-END_DATE = "2024-06-01"      # 回测结束日期 (YYYY-MM-DD)
+START_DATE = "2023-01-01"    # 回测开始日期 (YYYY-MM-DD)
+END_DATE = "2026-02-13"      # 回测结束日期 (YYYY-MM-DD)
 
 # 股票池（从 const.py 导入，也可在此覆盖）
 # 如果 STOCK_LIST 为空，则自动获取全部股票
@@ -184,6 +184,7 @@ class MultiStockBacktestEngine:
         self.records: List[DailyRecord] = []
         self.trade_count = 0
         self.daily_prices: Dict[str, Dict[str, float]] = {}  # date -> {code: price}
+        self.last_price: Dict[str, float] = {}               # code -> last known close (carry-forward for停牌/缺失)
         self.code_name_map = code_name_map or {}  # 代码到名称的映射
         self.output_file = None  # 输出文件句柄
         
@@ -436,6 +437,20 @@ class MultiStockBacktestEngine:
                 if date not in self.daily_prices:
                     self.daily_prices[date] = {}
                 self.daily_prices[date][code] = price
+
+        # 对缺失行情做“前值填充”（carry-forward）：
+        # - 解决停牌/数据缺口导致的 price=0 -> 市值归零 -> -100% 假象
+        # - 仅用于估值/打印；信号计算仍基于当日是否有价格（无价格则不会进入 daily_prices）
+        last = {}
+        for d in sorted(self.daily_prices.keys()):
+            day_map = self.daily_prices[d]
+            for c in self.stock_pool:
+                if c in day_map and day_map[c] is not None:
+                    last[c] = float(day_map[c])
+                elif c in last:
+                    # 仅填充缺失的 code
+                    day_map.setdefault(c, last[c])
+        self.last_price = last
 
         conn.close()
 
