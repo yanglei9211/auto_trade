@@ -81,7 +81,10 @@ class RiskManager:
         current_price: float,
         highest_price: float,
         atr: float = 0,
-        hold_days: int = 0
+        hold_days: int = 0,
+        score: float = 0.0,
+        time_stop_requires_weak_score: bool = True,
+        time_stop_score_threshold: float = 0.0,
     ) -> Tuple[bool, str]:
         """
         检查是否触发止损
@@ -92,7 +95,10 @@ class RiskManager:
             highest_price: 持仓期间最高价
             atr: ATR值 (可选)
             hold_days: 持仓天数 (可选)
-            
+            score: 策略综合得分（用于时间止损的“弱趋势”判定）
+            time_stop_requires_weak_score: 是否要求 score 偏弱才触发时间止损
+            time_stop_score_threshold: score 阈值（默认 0.0，表示 score<=0 才触发时间止损）
+
         返回:
             (是否止损, 止损原因)
         """
@@ -119,9 +125,10 @@ class RiskManager:
             if drawdown_pct >= self.trail_stop_pct:
                 return True, f"移动止损 (回撤{drawdown_pct*100:.1f}%)"
 
-        # 4) 时间止损
+        # 4) 时间止损（方案A：仅在“得分偏弱/趋势不佳”时触发，避免震荡市被频繁洗出）
         if hold_days >= self.time_stop_days and current_price <= entry_price:
-            return True, f"时间止损 (持仓{hold_days}天未盈利)"
+            if (not time_stop_requires_weak_score) or (score <= time_stop_score_threshold):
+                return True, f"时间止损 (持仓{hold_days}天未盈利, score={score:+.3f})"
 
         return False, ""
 
@@ -558,7 +565,10 @@ class Strategy:
                 current_price=self.current_price,
                 highest_price=highest_price if highest_price > 0 else self.current_price,
                 atr=self.atr,
-                hold_days=hold_days
+                hold_days=hold_days,
+                score=score,
+                time_stop_requires_weak_score=True,
+                time_stop_score_threshold=0.0,
             )
             
             if should_stop:
