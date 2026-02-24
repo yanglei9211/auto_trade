@@ -49,8 +49,8 @@ TABLE_NAME = "stock_daily"
 # ==================== 回测参数配置（可修改） ====================
 
 # 回测时间范围
-START_DATE = "2023-01-01"    # 回测开始日期 (YYYY-MM-DD)
-END_DATE = "2026-02-13"      # 回测结束日期 (YYYY-MM-DD)
+START_DATE = "2024-01-01"    # 回测开始日期 (YYYY-MM-DD)
+END_DATE = "2025-01-01"      # 回测结束日期 (YYYY-MM-DD)
 
 # 股票池（从 const.py 导入，也可在此覆盖）
 # 如果 STOCK_LIST 为空，则自动获取全部股票
@@ -138,13 +138,15 @@ class MultiStockBacktestEngine:
     """多股票回测引擎（集成风控和市场情绪）"""
 
     def _update_event_stats(self, trade: Dict):
-        """按 trade['reason'] 归因统计事件次数/金额。
+        """按 trade['reason'] 归因统计事件次数，并对 SELL reason 做聚合。
 
-        关注：止损、分批止盈1/2、止盈(兼容)、普通SELL、过滤拦截。
+        关注：止损(全卖/减仓)、分批止盈1/2、止盈(兼容)、普通SELL、过滤拦截。
+        同时统计 SELL reason TopN，便于定位“SELL_OTHER 为什么爆表”。
         """
         if not hasattr(self, "event_stats"):
             self.event_stats = {
-                "STOP_LOSS": 0,
+                "STOP_LOSS_FULL": 0,
+                "STOP_LOSS_PARTIAL": 0,
                 "TP1": 0,
                 "TP2": 0,
                 "TAKE_PROFIT_COMPAT": 0,
@@ -152,6 +154,7 @@ class MultiStockBacktestEngine:
                 "BUY": 0,
                 "FILTER_BLOCK": 0,
             }
+            self.sell_reason_counter = {}
 
         reason = (trade.get("reason") or "").strip()
         sig = trade.get("signal")
@@ -161,8 +164,19 @@ class MultiStockBacktestEngine:
             return
 
         if sig == "SELL":
-            if "【止损】" in reason:
-                self.event_stats["STOP_LOSS"] += 1
+            # 归一化 reason key（只取标签/前缀，避免把浮点数打散统计）
+            key = reason
+            if "," in key:
+                key = key.split(",", 1)[0]
+            if "综合得分" in key:
+                key = key.split("综合得分", 1)[0].strip()
+            key = key[:60]
+            self.sell_reason_counter[key] = self.sell_reason_counter.get(key, 0) + 1
+
+            if "【止损-减仓】" in reason:
+                self.event_stats["STOP_LOSS_PARTIAL"] += 1
+            elif "【止损】" in reason:
+                self.event_stats["STOP_LOSS_FULL"] += 1
             elif "【分批止盈1】" in reason:
                 self.event_stats["TP1"] += 1
             elif "【分批止盈2】" in reason:
@@ -1026,12 +1040,20 @@ class MultiStockBacktestEngine:
             es = self.event_stats
             self.print_and_write(f"\n【事件归因统计】")
             self.print_and_write(f"  BUY:                 {es.get('BUY', 0)}")
-            self.print_and_write(f"  STOP_LOSS(全卖):      {es.get('STOP_LOSS', 0)}")
+            self.print_and_write(f"  STOP_LOSS(全卖):      {es.get('STOP_LOSS_FULL', 0)}")
+            self.print_and_write(f"  STOP_LOSS(减仓):      {es.get('STOP_LOSS_PARTIAL', 0)}")
             self.print_and_write(f"  TP1(8%卖1/3):         {es.get('TP1', 0)}")
             self.print_and_write(f"  TP2(15%再卖1/3):      {es.get('TP2', 0)}")
             self.print_and_write(f"  TAKE_PROFIT_COMPAT:   {es.get('TAKE_PROFIT_COMPAT', 0)}")
             self.print_and_write(f"  SELL_OTHER:           {es.get('SELL_OTHER', 0)}")
             self.print_and_write(f"  FILTER_BLOCK(HOLD):   {es.get('FILTER_BLOCK', 0)}")
+
+            # 输出 SELL reason TopN
+            if hasattr(self, 'sell_reason_counter') and self.sell_reason_counter:
+                top = sorted(self.sell_reason_counter.items(), key=lambda kv: kv[1], reverse=True)[:15]
+                self.print_and_write(f"\n【SELL reason Top15】")
+                for k, v in top:
+                    self.print_and_write(f"  {v:>4}  {k}")
 
         # 打印有交易的股票详情
         if traded_stats:
