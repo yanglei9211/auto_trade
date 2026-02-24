@@ -532,8 +532,9 @@ class Strategy:
             self.calculate_all_factors()
         return sum(self.signals.values())
 
-    def generate_signal(self, current_hold: int, entry_price: float = 0, 
-                        highest_price: float = 0, hold_days: int = 0) -> TradeDecision:
+    def generate_signal(self, current_hold: int, entry_price: float = 0,
+                        highest_price: float = 0, hold_days: int = 0,
+                        tp_stage: int = 0) -> TradeDecision:
         """
         生成交易信号 (含风险管理)
         
@@ -542,7 +543,8 @@ class Strategy:
             entry_price: 持仓成本价 (可选，用于止损判断)
             highest_price: 持仓期间最高价 (可选，用于移动止损)
             hold_days: 持仓天数 (可选，用于时间止损)
-            
+            tp_stage: 分批止盈阶段（0未触发；1已触发8%；2已触发15%）
+
         返回:
             TradeDecision: 交易决策
         """
@@ -575,25 +577,22 @@ class Strategy:
         if current_hold > 0 and entry_price > 0:
             profit_pct = (self.current_price - entry_price) / entry_price
 
-            # 用 hold_days 做一个“阶段”近似：
-            # - 第一次止盈触发后，持仓会减少且 hold_days 仍继续递增；
-            # - 为避免每天在阈值附近反复卖出，这里用“持仓是否已经低于原始持仓的2/3、1/3”作为隐式阶段信号。
-            #   注意：该方法不完美，但无需改 eval.py 的持仓结构，实施成本最低。
+            # 用 tp_stage 做分批止盈状态机，防止在阈值之上连续多天重复卖出。
 
             # 估算分批卖出股数（手取整）
             def _sell_frac(hold: int, frac: float) -> int:
                 raw = int(hold * frac)
                 return max(int(raw / 100) * 100, 0)
 
-            # 第一档：盈利>=8%，卖出约1/3
-            if profit_pct >= TP1_PROFIT_PCT and current_hold >= 300:
+            # 第一档：盈利>=8%，卖出约1/3（仅触发一次）
+            if tp_stage <= 0 and profit_pct >= TP1_PROFIT_PCT and current_hold >= 300:
                 sell_shares = _sell_frac(current_hold, TP_SELL_FRACTION)
                 if sell_shares > 0:
                     reason = f"【分批止盈1】盈利{profit_pct*100:.1f}%>=8%，卖出1/3({sell_shares})，综合得分: {score:+.3f}"
                     return TradeDecision(Signal.SELL, sell_shares, reason, 0.8)
 
-            # 第二档：盈利>=15%，再卖出约1/3
-            if profit_pct >= TP2_PROFIT_PCT and current_hold >= 300:
+            # 第二档：盈利>=15%，再卖出约1/3（仅触发一次）
+            if tp_stage == 1 and profit_pct >= TP2_PROFIT_PCT and current_hold >= 300:
                 sell_shares = _sell_frac(current_hold, TP_SELL_FRACTION)
                 if sell_shares > 0:
                     reason = f"【分批止盈2】盈利{profit_pct*100:.1f}%>=15%，再卖出1/3({sell_shares})，综合得分: {score:+.3f}"
@@ -750,6 +749,7 @@ def get_trade_signal(code: str, date: str, hold: int,
                      entry_price: float = 0,
                      highest_price: float = 0,
                      hold_days: int = 0,
+                     tp_stage: int = 0,
                      db_path: str = None,
                      table_name: str = None,
                      industry_alpha_score: float = 0.0,
@@ -776,6 +776,7 @@ def get_trade_signal(code: str, date: str, hold: int,
         industry_alpha_score: 行业 Alpha 得分 (可选)
         industry_rank: 行业排名 (可选)
         use_industry_alpha: 是否使用行业 Alpha 因子 (可选)
+        tp_stage: 分批止盈阶段（0未触发；1已触发8%；2已触发15%）
 
     返回:
         (交易决策, 历史数据列表, 当前价格)
@@ -797,7 +798,7 @@ def get_trade_signal(code: str, date: str, hold: int,
     if use_industry_alpha and industry_alpha_score != 0.0:
         strategy.apply_industry_alpha(industry_alpha_score, industry_rank, alpha_weight=industry_alpha_weight)
 
-    decision = strategy.generate_signal(hold, entry_price, highest_price, hold_days)
+    decision = strategy.generate_signal(hold, entry_price, highest_price, hold_days, tp_stage)
 
     # 如果启用了行业 Alpha，在理由中追加信息
     if use_industry_alpha and industry_rank <= 10:

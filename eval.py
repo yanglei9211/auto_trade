@@ -104,6 +104,7 @@ class StockPosition:
     entry_date: str = ""           # 入场日期
     highest_price: float = 0.0     # 持仓期间最高价（用于移动止损）
     hold_days: int = 0             # 持仓天数
+    tp_stage: int = 0              # 分批止盈阶段：0未触发；1已触发8%；2已触发15%
 
     @property
     def market_value(self, price: float = 0) -> float:
@@ -158,6 +159,9 @@ class MultiStockBacktestEngine:
         self.enable_market_sentiment = enable_market_sentiment
         self.current_position_limit = 1.0  # 当前仓位上限（根据市场情绪动态调整）
         self.sentiment_history: Dict[str, Dict] = {}  # 记录每日情绪
+
+        # 可交易池过滤缓存：date -> {code: TradableResult}
+        self.tradable_cache: Dict[str, Dict[str, object]] = {}
 
         # 行业 Alpha 因子
         self.use_industry_alpha = USE_INDUSTRY_ALPHA and INDUSTRY_ALPHA_AVAILABLE
@@ -424,19 +428,29 @@ class MultiStockBacktestEngine:
 
         # ========== 可交易池过滤（仅影响 BUY；SELL 一律放行以便退出） ==========
         try:
-            cfg = TradableFilterConfig(
-                amount_window=20,
-                min_avg_amount=LIQUIDITY_MIN_AVG_AMOUNT_20D,
-                min_listing_days=MIN_LISTING_DAYS,
-            )
-            with sqlite3.connect(DB_PATH) as conn:
+            day_cache = self.tradable_cache.get(date)
+            if day_cache is None:
+                day_cache = {}
+                self.tradable_cache[date] = day_cache
+
+            tr = day_cache.get(code)
+            if tr is None:
+                cfg = TradableFilterConfig(
+                    amount_window=20,
+                    min_avg_amount=LIQUIDITY_MIN_AVG_AMOUNT_20D,
+                    min_listing_days=MIN_LISTING_DAYS,
+                )
+                # 复用单个连接计算，避免每票反复 connect
+                conn = getattr(self, "_tradable_conn", None)
+                if conn is None:
+                    self._tradable_conn = sqlite3.connect(DB_PATH)
+                    conn = self._tradable_conn
                 tr = check_tradable(conn, code, date, cfg)
-            if not tr.tradable:
-                # 不允许开新仓/加仓，但允许继续走到后面生成 SELL（止损/止盈/趋势退出）
-                # 这里采取“先看当前是否持仓”：
-                if position.shares <= 0:
-                    return "HOLD", 0, f"不可交易池过滤: {tr.reason}"
-        except Exception as e:
+                day_cache[code] = tr
+
+            if not tr.tradable and position.shares <= 0:
+                return "HOLD", 0, f"不可交易池过滤: {tr.reason}"
+        except Exception:
             # 过滤异常时不阻断交易信号（保守：让策略继续跑）
             pass
 
@@ -472,6 +486,7 @@ class MultiStockBacktestEngine:
                 entry_price=position.avg_cost if position.shares > 0 else 0,
                 highest_price=position.highest_price if position.shares > 0 else price,
                 hold_days=position.hold_days if position.shares > 0 else 0,
+                tp_stage=position.tp_stage if position.shares > 0 else 0,
                 db_path=DB_PATH,           # 使用 eval.py 的数据库路径
                 table_name=TABLE_NAME,      # 使用 eval.py 的表名
                 industry_alpha_score=industry_alpha_score,
@@ -499,7 +514,8 @@ class MultiStockBacktestEngine:
             "amount": 0.0,
             "commission": 0.0,
             "stamp_tax": 0.0,
-            "success": False
+            "success": False,
+            "reason": "",
         }
 
         if signal == "HOLD" or shares <= 0:
@@ -533,6 +549,7 @@ class MultiStockBacktestEngine:
                 position.entry_date = date
                 position.highest_price = price
                 position.hold_days = 0
+                position.tp_stage = 0  # 新开仓重置分批止盈阶段
 
             self.cash -= total_cost
             self.trade_count += 1
@@ -560,6 +577,7 @@ class MultiStockBacktestEngine:
                 position.entry_date = ""
                 position.highest_price = 0
                 position.hold_days = 0
+                position.tp_stage = 0
 
             self.cash += trade_amount - commission - stamp_tax
             self.trade_count += 1
@@ -644,6 +662,15 @@ class MultiStockBacktestEngine:
                     trade = self.execute_trade(code, signal, shares, price, date)
                     if trade["success"]:
                         trade["reason"] = reason
+                        # 分批止盈阶段推进（根据 reason 标签；不依赖额外字段回传，改动最小）
+                        try:
+                            pos = self.positions[code]
+                            if "【分批止盈1】" in reason:
+                                pos.tp_stage = max(pos.tp_stage, 1)
+                            elif "【分批止盈2】" in reason:
+                                pos.tp_stage = max(pos.tp_stage, 2)
+                        except Exception:
+                            pass
                         trade["name"] = self.get_stock_name(code)
                         trade['score'] = score  # 记录评分
                         daily_trades.append(trade)
@@ -680,6 +707,15 @@ class MultiStockBacktestEngine:
             # 打印当日详情（只打印有交易的日子）
             if daily_trades:
                 self.print_daily_summary(record)
+
+        # 关闭过滤缓存的连接
+        try:
+            conn = getattr(self, "_tradable_conn", None)
+            if conn is not None:
+                conn.close()
+                self._tradable_conn = None
+        except Exception:
+            pass
 
         # 打印回测结果汇总
         self.print_final_summary()
