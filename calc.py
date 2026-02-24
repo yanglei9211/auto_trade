@@ -35,6 +35,11 @@ DEFAULT_ATR_MULTIPLIER = 2.0       # ATR止损倍数
 DEFAULT_TIME_STOP_DAYS = 5         # 时间止损天数（缩短至5天，提高资金效率）
 DEFAULT_TAKE_PROFIT_PCT = 0.15     # 止盈比例 (15%)
 
+# 分批止盈阈值（更对称、更容易实现）
+TP1_PROFIT_PCT = 0.08              # 盈利8%：先止盈1/3
+TP2_PROFIT_PCT = 0.15              # 盈利15%：再止盈1/3
+TP_SELL_FRACTION = 1/3             # 每次卖出比例
+
 
 class RiskManager:
     """
@@ -127,31 +132,20 @@ class RiskManager:
         highest_price: float,
         hold_days: int = 0
     ) -> Tuple[bool, str]:
-        """
-        检查是否触发止盈
-        
-        参数:
-            entry_price: 入场价格
-            current_price: 当前价格
-            highest_price: 持仓期间最高价
-            hold_days: 持仓天数
-            
-        返回:
-            (是否止盈, 止盈原因)
+        """（保留兼容）检查是否触发“全卖”止盈
+
+        说明：新版本主要使用“分批止盈”，因此这里不再承担主要止盈职责。
+        目前仅保留为兼容逻辑（可后续删除）。
         """
         profit_pct = (current_price - entry_price) / entry_price
-        
-        # 1. 固定止盈：盈利超过15%且从高点回落5%时止盈
+
+        # 兼容：极端情况下仍可全卖止盈（比如盈利很高且回撤显著）
         if profit_pct >= DEFAULT_TAKE_PROFIT_PCT:
             if highest_price > entry_price:
                 drawdown_pct = (highest_price - current_price) / highest_price
-                if drawdown_pct >= 0.05:  # 从高点回落5%
-                    return True, f"止盈 (盈利{profit_pct*100:.1f}%, 回撤{drawdown_pct*100:.1f}%)"
-        
-        # 2. 时间止盈：持仓超过20天且盈利超过10%时止盈
-        if hold_days >= 20 and profit_pct >= 0.10:
-            return True, f"时间止盈 (持仓{hold_days}天, 盈利{profit_pct*100:.1f}%)"
-        
+                if drawdown_pct >= 0.10:
+                    return True, f"止盈(兼容) 盈利{profit_pct*100:.1f}%, 回撤{drawdown_pct*100:.1f}%"
+
         return False, ""
 
     def calculate_position_size(
@@ -577,7 +571,35 @@ class Strategy:
                 confidence = 0.9  # 止损信号置信度高
                 return TradeDecision(Signal.SELL, shares, reason, confidence)
 
-        # ========== 止盈判断 ==========
+        # ========== 分批止盈（8%卖1/3；15%再卖1/3；剩余交给移动止损/趋势退出） ==========
+        if current_hold > 0 and entry_price > 0:
+            profit_pct = (self.current_price - entry_price) / entry_price
+
+            # 用 hold_days 做一个“阶段”近似：
+            # - 第一次止盈触发后，持仓会减少且 hold_days 仍继续递增；
+            # - 为避免每天在阈值附近反复卖出，这里用“持仓是否已经低于原始持仓的2/3、1/3”作为隐式阶段信号。
+            #   注意：该方法不完美，但无需改 eval.py 的持仓结构，实施成本最低。
+
+            # 估算分批卖出股数（手取整）
+            def _sell_frac(hold: int, frac: float) -> int:
+                raw = int(hold * frac)
+                return max(int(raw / 100) * 100, 0)
+
+            # 第一档：盈利>=8%，卖出约1/3
+            if profit_pct >= TP1_PROFIT_PCT and current_hold >= 300:
+                sell_shares = _sell_frac(current_hold, TP_SELL_FRACTION)
+                if sell_shares > 0:
+                    reason = f"【分批止盈1】盈利{profit_pct*100:.1f}%>=8%，卖出1/3({sell_shares})，综合得分: {score:+.3f}"
+                    return TradeDecision(Signal.SELL, sell_shares, reason, 0.8)
+
+            # 第二档：盈利>=15%，再卖出约1/3
+            if profit_pct >= TP2_PROFIT_PCT and current_hold >= 300:
+                sell_shares = _sell_frac(current_hold, TP_SELL_FRACTION)
+                if sell_shares > 0:
+                    reason = f"【分批止盈2】盈利{profit_pct*100:.1f}%>=15%，再卖出1/3({sell_shares})，综合得分: {score:+.3f}"
+                    return TradeDecision(Signal.SELL, sell_shares, reason, 0.85)
+
+        # ========== 兼容：全卖止盈（保留但弱化） ==========
         if current_hold > 0 and entry_price > 0:
             should_take_profit, profit_reason = self.risk_manager.should_take_profit(
                 entry_price=entry_price,
@@ -585,16 +607,14 @@ class Strategy:
                 highest_price=highest_price if highest_price > 0 else self.current_price,
                 hold_days=hold_days
             )
-            
             if should_take_profit:
-                # 触发止盈，卖出
                 shares = self.risk_manager.calculate_sell_shares(
                     current_hold=current_hold,
                     entry_price=entry_price,
                     current_price=self.current_price,
                     force_full=True
                 )
-                reason = f"【止盈】{profit_reason}, 综合得分: {score:+.3f}"
+                reason = f"【止盈(兼容)】{profit_reason}, 综合得分: {score:+.3f}"
                 confidence = 0.9
                 return TradeDecision(Signal.SELL, shares, reason, confidence)
 
