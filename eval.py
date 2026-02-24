@@ -224,21 +224,21 @@ class MultiStockBacktestEngine:
         
         参数:
             args: (code, date, price, position_shares, position_avg_cost, 
-                   position_highest_price, position_hold_days, initial_cash)
+                   position_highest_price, position_hold_days, tp_stage, initial_cash)
         
         返回:
             信号信息字典
         """
         (code, date, price, position_shares, position_avg_cost,
-         position_highest_price, position_hold_days, initial_cash) = args
+         position_highest_price, position_hold_days, tp_stage, initial_cash) = args
         
         try:
             # 导入必要的模块（在子进程中）
             from calc import get_trade_signal, RiskManager
             from const import STOCK_DB_PATH, MAX_POSITION, MIN_POSITION, SINGLE_TRADE_RATIO
             
-            # 创建独立的风险管理器实例
-            risk_manager = RiskManager()
+            # 创建独立的风险管理器实例（参数需与主进程兼容）
+            risk_manager = RiskManager(min_stop_loss_pct=0.10)
             
             # 调用信号生成
             decision, _, _ = get_trade_signal(
@@ -253,6 +253,7 @@ class MultiStockBacktestEngine:
                 entry_price=position_avg_cost if position_shares > 0 else 0,
                 highest_price=position_highest_price if position_shares > 0 else price,
                 hold_days=position_hold_days if position_shares > 0 else 0,
+                tp_stage=tp_stage if position_shares > 0 else 0,
                 db_path=STOCK_DB_PATH,
                 table_name="stock_daily"
             )
@@ -288,6 +289,7 @@ class MultiStockBacktestEngine:
                 position.avg_cost,
                 position.highest_price,
                 position.hold_days,
+                position.tp_stage,
                 self.initial_cash
             )
             args_list.append(args)
