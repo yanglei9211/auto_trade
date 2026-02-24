@@ -155,6 +155,7 @@ class MultiStockBacktestEngine:
                 "FILTER_BLOCK": 0,
             }
             self.sell_reason_counter = {}
+            self.time_stop_by_code = {}  # code -> [(date, reason_prefix)]
 
         reason = (trade.get("reason") or "").strip()
         sig = trade.get("signal")
@@ -175,6 +176,12 @@ class MultiStockBacktestEngine:
 
             if "【止损-减仓】" in reason:
                 self.event_stats["STOP_LOSS_PARTIAL"] += 1
+                # 记录“时间止损减仓”按股票维度统计
+                if "时间止损" in reason:
+                    code = trade.get("code", "")
+                    d = trade.get("date", "")
+                    if code:
+                        self.time_stop_by_code.setdefault(code, []).append((d, key))
             elif "【止损】" in reason:
                 self.event_stats["STOP_LOSS_FULL"] += 1
             elif "【分批止盈1】" in reason:
@@ -578,6 +585,7 @@ class MultiStockBacktestEngine:
         """执行交易（含风控信息更新）"""
         result = {
             "code": code,
+            "date": date,
             "signal": signal,
             "shares": 0,
             "price": price,
@@ -1054,6 +1062,21 @@ class MultiStockBacktestEngine:
                 self.print_and_write(f"\n【SELL reason Top15】")
                 for k, v in top:
                     self.print_and_write(f"  {v:>4}  {k}")
+
+            # 输出“时间止损减仓”按股票维度统计
+            if hasattr(self, 'time_stop_by_code') and self.time_stop_by_code:
+                items = sorted(self.time_stop_by_code.items(), key=lambda kv: len(kv[1]), reverse=True)
+                self.print_and_write(f"\n【时间止损-减仓 按股票次数Top20】")
+                for code, rows in items[:20]:
+                    name = self.get_stock_name(code)
+                    self.print_and_write(f"  {len(rows):>4}  {code} {name}")
+                # 可选：打印Top5的触发日期样例
+                self.print_and_write(f"\n【时间止损-减仓 Top5触发日期样例】")
+                for code, rows in items[:5]:
+                    name = self.get_stock_name(code)
+                    dates = [d for d, _ in rows]
+                    dates_txt = ",".join(dates[:12]) + ("..." if len(dates) > 12 else "")
+                    self.print_and_write(f"  {code} {name}: {dates_txt}")
 
         # 打印有交易的股票详情
         if traded_stats:
