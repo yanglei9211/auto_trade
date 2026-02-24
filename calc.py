@@ -504,9 +504,8 @@ class Strategy:
         参数:
             industry_alpha_score: 行业 Alpha 得分 (-1 到 1)
             industry_rank: 行业排名 (1-5为推荐行业)
+            alpha_weight: 行业Alpha权重（由外部传入；默认0.10）
         """
-        # 行业 Alpha 权重 10%
-        alpha_weight = 0.10
 
         # 排名越靠前，Alpha 因子得分越高
         if industry_rank <= 3:
