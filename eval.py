@@ -500,6 +500,22 @@ class MultiStockBacktestEngine:
         return days
 
     def generate_signal(self, code: str, date: str, price: float) -> Tuple[str, int, str]:
+        # 统计：每日信号覆盖率（总计数，避免逐日输出过大）
+        if not hasattr(self, "signal_cover_stats"):
+            self.signal_cover_stats = {
+                "days": 0,
+                "evaluations": 0,
+                "buy_signals": 0,
+                "sell_signals": 0,
+                "hold_signals": 0,
+                "buy_codes": set(),
+                "sell_codes": set(),
+                "_last_date": None,
+            }
+        if self.signal_cover_stats.get("_last_date") != date:
+            self.signal_cover_stats["days"] += 1
+            self.signal_cover_stats["_last_date"] = date
+        self.signal_cover_stats["evaluations"] += 1
         """
         使用 calc.py 的多因子策略生成信号（含风控和行业Alpha）
         返回: (信号类型, 建议股数, 交易依据)
@@ -529,9 +545,26 @@ class MultiStockBacktestEngine:
                 day_cache[code] = tr
 
             if not tr.tradable and position.shares <= 0:
+                # 统计：不可交易池拦截（仅拦 BUY，SELL 放行）
+                if not hasattr(self, "tradable_filter_stats"):
+                    self.tradable_filter_stats = {
+                        "blocked": 0,
+                        "blocked_by_reason": {},
+                    }
+                self.tradable_filter_stats["blocked"] += 1
+                reason_key = (tr.reason or "UNKNOWN")[:80]
+                self.tradable_filter_stats["blocked_by_reason"][reason_key] = self.tradable_filter_stats["blocked_by_reason"].get(reason_key, 0) + 1
+
                 return "HOLD", 0, f"不可交易池过滤: {tr.reason}"
         except Exception:
             # 过滤异常时不阻断交易信号（保守：让策略继续跑）
+            if not hasattr(self, "tradable_filter_stats"):
+                self.tradable_filter_stats = {
+                    "blocked": 0,
+                    "blocked_by_reason": {},
+                }
+            self.tradable_filter_stats["blocked"] += 1
+            self.tradable_filter_stats["blocked_by_reason"]["EXCEPTION"] = self.tradable_filter_stats["blocked_by_reason"].get("EXCEPTION", 0) + 1
             pass
 
         # 准备行业 Alpha 因子参数
@@ -578,6 +611,17 @@ class MultiStockBacktestEngine:
 
             # 将 Signal 枚举转换为字符串
             signal_str = decision.signal.value
+
+            # 统计：信号分布（按返回的最终信号）
+            if hasattr(self, "signal_cover_stats"):
+                if signal_str == "BUY":
+                    self.signal_cover_stats["buy_signals"] += 1
+                    self.signal_cover_stats["buy_codes"].add(code)
+                elif signal_str == "SELL":
+                    self.signal_cover_stats["sell_signals"] += 1
+                    self.signal_cover_stats["sell_codes"].add(code)
+                else:
+                    self.signal_cover_stats["hold_signals"] += 1
 
             return signal_str, decision.shares, decision.reason
 
@@ -1134,6 +1178,34 @@ class MultiStockBacktestEngine:
         profitable_stocks = sum(1 for s in traded_stats.values() if s['total_pnl'] > 0)
         losing_stocks = sum(1 for s in traded_stats.values() if s['total_pnl'] < 0)
         total_pnl = sum(s['total_pnl'] for s in traded_stats.values())
+
+        # ========== 额外诊断输出：可交易池拦截 & 信号覆盖率 ==========
+        if hasattr(self, "tradable_filter_stats"):
+            blocked = self.tradable_filter_stats.get("blocked", 0)
+            by_reason = self.tradable_filter_stats.get("blocked_by_reason", {})
+            self.print_and_write(f"\n【诊断-不可交易池过滤】")
+            self.print_and_write(f"  被过滤拦截次数(HOLD直接返回): {blocked}")
+            if by_reason:
+                top = sorted(by_reason.items(), key=lambda x: x[1], reverse=True)[:20]
+                self.print_and_write(f"  Top原因(前20):")
+                for reason, n in top:
+                    self.print_and_write(f"    {n:>6}  {reason}")
+
+        if hasattr(self, "signal_cover_stats"):
+            s = self.signal_cover_stats
+            evals = max(int(s.get("evaluations", 0)), 1)
+            days = int(s.get("days", 0))
+            buy = int(s.get("buy_signals", 0))
+            sell = int(s.get("sell_signals", 0))
+            hold = int(s.get("hold_signals", 0))
+            buy_codes = len(s.get("buy_codes", set()))
+            sell_codes = len(s.get("sell_codes", set()))
+            self.print_and_write(f"\n【诊断-信号覆盖率】")
+            self.print_and_write(f"  交易日计数: {days}")
+            self.print_and_write(f"  信号评估次数(=交易日*股票数): {evals}")
+            self.print_and_write(f"  BUY 信号次数:  {buy}  ({buy/evals*100:.2f}%)  覆盖股票数: {buy_codes}")
+            self.print_and_write(f"  SELL 信号次数: {sell} ({sell/evals*100:.2f}%)  覆盖股票数: {sell_codes}")
+            self.print_and_write(f"  HOLD 信号次数: {hold} ({hold/evals*100:.2f}%)")
 
         self.print_and_write(f"\n【整体统计】")
         self.print_and_write(f"  有交易股票数:  {len(traded_stats)} / {len(stock_stats)}")
