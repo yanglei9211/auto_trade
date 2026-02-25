@@ -45,8 +45,12 @@ except ImportError:
 DEFAULT_OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "eval_output")
 RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 RUN_TAG = os.environ.get("RUN_TAG", "")
-TIME_STOP_DAYS = int(os.environ.get("TIME_STOP_DAYS", "10"))
-TIME_STOP_SCORE_THRESHOLD = float(os.environ.get("TIME_STOP_SCORE_THRESHOLD", "-0.1"))
+# 默认参数（不指定环境变量时使用）——当前推荐：E 组
+DEFAULT_TIME_STOP_DAYS = 15
+DEFAULT_TIME_STOP_SCORE_THRESHOLD = -0.2
+
+TIME_STOP_DAYS = int(os.environ.get("TIME_STOP_DAYS", str(DEFAULT_TIME_STOP_DAYS)))
+TIME_STOP_SCORE_THRESHOLD = float(os.environ.get("TIME_STOP_SCORE_THRESHOLD", str(DEFAULT_TIME_STOP_SCORE_THRESHOLD)))
 
 suffix_parts = [
     f"tsd{TIME_STOP_DAYS}",

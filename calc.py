@@ -574,8 +574,9 @@ class Strategy:
                 hold_days=hold_days,
                 score=score,
                 time_stop_requires_weak_score=True,
-                # 可通过环境变量覆盖：TIME_STOP_SCORE_THRESHOLD（默认 -0.1）
-                time_stop_score_threshold=float(__import__('os').environ.get('TIME_STOP_SCORE_THRESHOLD', '-0.1')),
+                # 可通过环境变量覆盖：TIME_STOP_SCORE_THRESHOLD
+                # 默认参数（不指定环境变量时使用）——当前推荐：E 组
+                time_stop_score_threshold=float(__import__('os').environ.get('TIME_STOP_SCORE_THRESHOLD', '-0.2')),
                 sl_stage=sl_stage,
             )
 
