@@ -285,14 +285,26 @@ def plot_comparison(backtest_data: List[Tuple[str, float]],
 
 
 def main():
-    """主函数"""
-    # 默认读取最新的 eval_output.txt
-    script_dir = Path(__file__).parent
-    eval_output_path = script_dir / "eval_output.txt"
+    """主函数
+    
+    用法:
+        python plot_backtest.py                    # 默认读取 eval_output.txt，生成 eval_output.png
+        python plot_backtest.py result.txt         # 读取 result.txt，生成 result.png
+    """
+    import sys
+    
+    # 获取输入文件路径
+    if len(sys.argv) > 1:
+        eval_output_path = Path(sys.argv[1])
+    else:
+        # 默认读取 eval_output.txt
+        script_dir = Path(__file__).parent
+        eval_output_path = script_dir / "eval_output.txt"
     
     if not eval_output_path.exists():
         print(f"错误: 找不到回测结果文件: {eval_output_path}")
-        print("请确保 eval.py 回测已完成并生成 eval_output.txt")
+        print("请确保回测已完成并生成输出文件")
+        print("\n用法: python plot_backtest.py [回测结果文件路径]")
         return
     
     print(f"正在解析回测结果: {eval_output_path}")
@@ -337,10 +349,9 @@ def main():
             print(f"  中证500: {returns['zz500']:+.2f}%")
             print(f"  超额收益(中证500): {total_return - returns['zz500']:+.2f}%")
     
-    # 保存图表（带时间戳，避免覆盖）
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = script_dir / f"backtest_comparison_{timestamp}.png"
+    # 生成输出图片路径（与输入文件同名，仅后缀改为.png）
+    output_path = eval_output_path.with_suffix('.png')
+    print(f"\n正在保存图表: {output_path}")
     plot_comparison(backtest_data, index_data_dict, initial_value, str(output_path))
 
 

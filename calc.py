@@ -32,7 +32,7 @@ DEFAULT_SINGLE_TRADE_RATIO = 0.2   # 单次交易占总资金比例
 DEFAULT_MIN_STOP_LOSS_PCT = 0.10   # 最小止损比例下限 (10%)
 DEFAULT_TRAIL_STOP_PCT = 0.10      # 移动止损比例 (10%)
 DEFAULT_ATR_MULTIPLIER = 2.0       # ATR止损倍数
-DEFAULT_TIME_STOP_DAYS = 5         # 时间止损天数（缩短至5天，提高资金效率）
+DEFAULT_TIME_STOP_DAYS = 10        # 时间止损天数（10天效果最好）
 DEFAULT_TAKE_PROFIT_PCT = 0.15     # 止盈比例 (15%)
 
 # 分批止盈阈值（更对称、更容易实现）
@@ -576,7 +576,7 @@ class Strategy:
                 time_stop_requires_weak_score=True,
                 # 可通过环境变量覆盖：TIME_STOP_SCORE_THRESHOLD
                 # 默认参数（不指定环境变量时使用）——当前推荐：E 组
-                time_stop_score_threshold=float(__import__('os').environ.get('TIME_STOP_SCORE_THRESHOLD', '-0.2')),
+                time_stop_score_threshold=float(__import__('os').environ.get('TIME_STOP_SCORE_THRESHOLD', '-0.1')),  # A策略：-0.1
                 sl_stage=sl_stage,
             )
 
@@ -639,9 +639,9 @@ class Strategy:
 
         # ========== 正常信号生成 ==========
         # 根据得分确定信号
-        if score > 0.3:
+        if score > 0.3:  # 买入阈值保持0.3
             signal = Signal.BUY
-        elif score < -0.3:
+        elif score < -0.3:  # 卖出阈值恢复-0.3
             signal = Signal.SELL
         else:
             signal = Signal.HOLD

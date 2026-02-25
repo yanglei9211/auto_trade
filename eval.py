@@ -46,21 +46,14 @@ DEFAULT_OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "eval_output")
 RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 RUN_TAG = os.environ.get("RUN_TAG", "")
 # 默认参数（不指定环境变量时使用）——当前推荐：E 组
-DEFAULT_TIME_STOP_DAYS = 15
-DEFAULT_TIME_STOP_SCORE_THRESHOLD = -0.2
+DEFAULT_TIME_STOP_DAYS = 10  # 10天效果最好
+DEFAULT_TIME_STOP_SCORE_THRESHOLD = -0.1  # 保持-0.1
 
 TIME_STOP_DAYS = int(os.environ.get("TIME_STOP_DAYS", str(DEFAULT_TIME_STOP_DAYS)))
 TIME_STOP_SCORE_THRESHOLD = float(os.environ.get("TIME_STOP_SCORE_THRESHOLD", str(DEFAULT_TIME_STOP_SCORE_THRESHOLD)))
 
-suffix_parts = [
-    f"tsd{TIME_STOP_DAYS}",
-    f"tst{TIME_STOP_SCORE_THRESHOLD}",
-    RUN_TS,
-]
-if RUN_TAG:
-    suffix_parts.insert(0, RUN_TAG)
-
-DEFAULT_OUTPUT_NAME = f"{DEFAULT_OUTPUT_PREFIX}_{'_'.join(suffix_parts)}.txt"
+# 文件名只保留时间戳
+DEFAULT_OUTPUT_NAME = f"eval_output_{RUN_TS}.txt"
 OUTPUT_FILE = Path(os.environ.get("OUTPUT_FILE", str(Path(__file__).parent / DEFAULT_OUTPUT_NAME)))
 
 # 数据库配置›
