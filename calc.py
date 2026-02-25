@@ -133,10 +133,9 @@ class RiskManager:
         # 4) 时间止损（方案A：仅在“得分偏弱/趋势不佳”时触发，避免震荡市被频繁洗出）
         if hold_days >= self.time_stop_days and current_price <= entry_price:
             if (not time_stop_requires_weak_score) or (score <= time_stop_score_threshold):
-                # 软止损：时间止损只减仓，不全清（避免震荡磨损右尾）
-                # 方案A：每次开仓最多触发两次（用 sl_stage 控制）
-                if sl_stage < 2:
-                    return True, f"时间止损 (持仓{hold_days}天未盈利, score={score:+.3f}, sl_stage={sl_stage})", False
+                # 时间止损：直接清仓（避免反复减仓磨损 + 交易成本累积）
+                # 方案B：触发则 force_full=True，由上层全卖处理
+                return True, f"时间止损 (持仓{hold_days}天未盈利, score={score:+.3f}, sl_stage={sl_stage})", True
 
         return False, "", False
 
