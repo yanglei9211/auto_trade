@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
@@ -39,8 +40,24 @@ try:
 except ImportError:
     INDUSTRY_ALPHA_AVAILABLE = False
 
-# 输出文件路径
-OUTPUT_FILE = Path(__file__).parent / "eval_output.txt"
+# 输出文件路径（默认会带参数与时间戳，避免覆盖）
+# 可通过环境变量 OUTPUT_FILE 覆盖为固定文件名。
+DEFAULT_OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "eval_output")
+RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_TAG = os.environ.get("RUN_TAG", "")
+TIME_STOP_DAYS = int(os.environ.get("TIME_STOP_DAYS", "10"))
+TIME_STOP_SCORE_THRESHOLD = float(os.environ.get("TIME_STOP_SCORE_THRESHOLD", "-0.1"))
+
+suffix_parts = [
+    f"tsd{TIME_STOP_DAYS}",
+    f"tst{TIME_STOP_SCORE_THRESHOLD}",
+    RUN_TS,
+]
+if RUN_TAG:
+    suffix_parts.insert(0, RUN_TAG)
+
+DEFAULT_OUTPUT_NAME = f"{DEFAULT_OUTPUT_PREFIX}_{'_'.join(suffix_parts)}.txt"
+OUTPUT_FILE = Path(os.environ.get("OUTPUT_FILE", str(Path(__file__).parent / DEFAULT_OUTPUT_NAME)))
 
 # 数据库配置›
 DB_PATH = STOCK_DB_PATH
@@ -1233,7 +1250,7 @@ def main():
         min_stop_loss_pct=0.10,  # 最小止损宽度下限（10%）
         trail_stop_pct=0.10,     # 10%移动止损
         atr_multiplier=2.0,      # ATR止损倍数
-        time_stop_days=10,       # 10天时间止损
+        time_stop_days=TIME_STOP_DAYS,       # 可通过环境变量 TIME_STOP_DAYS 覆盖
         max_position=0.1,        # 单只股票最大仓位10%（降低集中度）
         max_total_position=0.8   # 总最大仓位80%
     )
