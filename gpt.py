@@ -20,8 +20,8 @@ def get_available_models():
     Returns:
         可用模型列表
     """
-    api_url = "https://ai-gateway-internal.dp.tech/v1/models"
-    api_key = "sk-sjqhZZP8H9LNaIc4Utxikg"
+    api_url = "api"
+    api_key = "key"
     
     headers = {
         "Authorization": f"Bearer {api_key}",
