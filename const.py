@@ -126,6 +126,16 @@ ATR_MULTIPLIER = 2.0
 RM_MAX_POSITION = 0.15
 RM_MAX_TOTAL_POSITION = 0.7
 
+# ==================== 动态去杠杆（弱市强制减仓）====================
+# 说明：eval.py 中当“实际仓位 > 动态cap + buffer”时，可触发被动减仓，
+#       用于在弱市/情绪骤降时更快把总仓位拉回目标区间，降低回撤。
+# 是否启用
+FORCE_DELEVERAGE = True
+# 超过动态cap的容忍带（例如 0.05 表示允许高出 5% 不触发）
+DELEVERAGE_BUFFER = 0.05
+# 每个交易日最多执行的“强制减仓”卖出次数（防止单日过度换手）
+DELEVERAGE_MAX_SELLS_PER_DAY = 3
+
 # 信号阈值（按“最小改动方案”调整）
 BUY_SIGNAL_THRESHOLD = 0.18
 SELL_SIGNAL_THRESHOLD = -0.10

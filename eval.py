@@ -27,6 +27,7 @@ from const import (
     OUTPUT_PREFIX, RUN_TAG,
     MIN_STOP_LOSS_PCT, TRAIL_STOP_PCT, ATR_MULTIPLIER,
     RM_MAX_POSITION, RM_MAX_TOTAL_POSITION,
+    FORCE_DELEVERAGE, DELEVERAGE_BUFFER, DELEVERAGE_MAX_SELLS_PER_DAY,
 )
 
 from tradable_filter import TradableFilterConfig, check_tradable
@@ -409,6 +410,108 @@ class MultiStockBacktestEngine:
         ))
         
         return (current_ratio + planned_ratio) <= self.current_position_limit
+
+    def _maybe_force_deleverage(
+        self,
+        date: str,
+        daily_prices_raw: Dict[str, float],
+        daily_prices_ffill: Dict[str, float],
+        current_position_ratio: float,
+        daily_trades: List[Dict],
+    ) -> float:
+        """弱市强制减仓：当实际仓位超过动态cap+buffer 时，优先卖出“最弱”的持仓。
+
+        设计原则：
+        - 不改 calc 的信号逻辑：这里是“风控层动作”，直接通过 execute_trade 下单 SELL。
+        - SELL 不受可交易池过滤影响，保证能退出（和现有设计一致）。
+        - 每日最多卖出 N 次，避免过度换手。
+
+        返回：更新后的 current_position_ratio。
+        """
+        if not FORCE_DELEVERAGE:
+            return current_position_ratio
+
+        cap = float(getattr(self, "current_position_limit", 1.0) or 1.0)
+        if current_position_ratio <= cap + float(DELEVERAGE_BUFFER):
+            return current_position_ratio
+
+        sells_left = int(DELEVERAGE_MAX_SELLS_PER_DAY)
+        if sells_left <= 0:
+            return current_position_ratio
+
+        # 候选：当前有持仓且当日有 raw 价格可成交
+        held = []
+        for code, pos in self.positions.items():
+            if pos.shares > 0 and code in daily_prices_raw:
+                px = daily_prices_raw[code]
+                if px is None:
+                    continue
+                # 简单“弱势度”：综合得分越低越先卖；数据不足则按浮亏率
+                score = 0.0
+                try:
+                    decision, _, composite_score = get_trade_signal(
+                        code=code,
+                        date=date,
+                        hold=pos.shares,
+                        initial_capital=self.initial_cash,
+                        max_position=MAX_POSITION,
+                        min_position=MIN_POSITION,
+                        single_trade_ratio=SINGLE_TRADE_RATIO,
+                        risk_manager=self.risk_manager,
+                        entry_price=pos.avg_cost if pos.shares > 0 else 0,
+                        highest_price=pos.highest_price if pos.shares > 0 else px,
+                        hold_days=pos.hold_days if pos.shares > 0 else 0,
+                        tp_stage=pos.tp_stage if pos.shares > 0 else 0,
+                        sl_stage=pos.sl_stage if pos.shares > 0 else 0,
+                        db_path=DB_PATH,
+                        table_name=TABLE_NAME,
+                        industry_alpha_score=0.0,
+                        industry_rank=999,
+                        use_industry_alpha=False,
+                        industry_alpha_weight=INDUSTRY_ALPHA_WEIGHT,
+                    )
+                    score = float(composite_score or 0.0)
+                except Exception:
+                    # fallback: 按浮亏率卖弱势
+                    if pos.avg_cost > 0:
+                        score = float((px - pos.avg_cost) / pos.avg_cost)
+                    else:
+                        score = 0.0
+                held.append((score, code, px, pos.shares))
+
+        if not held:
+            return current_position_ratio
+
+        held.sort(key=lambda x: x[0])  # score 越低越先卖
+
+        # 目标：把仓位拉回 cap（尽量接近，不追求一次到位）
+        for score, code, px, shares in held:
+            if sells_left <= 0:
+                break
+            if current_position_ratio <= cap + float(DELEVERAGE_BUFFER):
+                break
+
+            # 每次卖出 1/3（手取整）；若不足一手则全卖
+            sell_shares = int(shares / 3 / 100) * 100
+            if sell_shares <= 0:
+                sell_shares = shares
+
+            trade = self.execute_trade(code, "SELL", sell_shares, px, date)
+            if not trade.get("success"):
+                continue
+
+            trade["name"] = self.get_stock_name(code)
+            trade["score"] = score
+            trade["confidence"] = 0.0
+            trade["reason"] = f"【强制减仓】pos>{cap*100:.0f}%+{DELEVERAGE_BUFFER*100:.0f}%，优先卖弱势持仓(score={score:+.3f})"
+            daily_trades.append(trade)
+            self._update_event_stats(trade)
+
+            sells_left -= 1
+            # 更新当前仓位比例（估值口径用 ffill）
+            current_position_ratio = self.get_current_total_position_ratio(daily_prices_ffill)
+
+        return current_position_ratio
 
     @staticmethod
     def _calculate_single_signal_static(args: Tuple) -> Dict:
@@ -939,6 +1042,15 @@ class MultiStockBacktestEngine:
             # 更新市场情绪（每日开盘前）
             sentiment = self.update_market_sentiment(date)
             current_position_ratio = self.get_current_total_position_ratio(daily_prices)
+
+            # 弱市强制减仓：在执行当日信号前先把总仓位压回动态cap附近
+            current_position_ratio = self._maybe_force_deleverage(
+                date=date,
+                daily_prices_raw=daily_prices_raw,
+                daily_prices_ffill=daily_prices,
+                current_position_ratio=current_position_ratio,
+                daily_trades=daily_trades,
+            )
 
             # 更新所有持仓的最高价和持仓天数（用于移动止损和时间止损）
             # 使用 raw 价格：停牌/缺失数据日不更新 highest/hold_days
