@@ -68,8 +68,18 @@ class MarketSentimentAnalyzer:
         conn.close()
 
         if not row:
-            return ETFSignal(code=code, price=0, ma20=0, ma60=0, trend="NEUTRAL",
-                           above_ma20=False, above_ma60=False)
+            # 无当日数据：返回中性信号，避免 dataclass 字段不匹配导致运行时异常
+            return ETFSignal(
+                code=code,
+                price=0.0,
+                ma5=0.0,
+                ma20=0.0,
+                trend="NEUTRAL",
+                above_ma5=False,
+                above_ma20=False,
+                ma20_rising=False,
+                golden_cross=False,
+            )
 
         price = row[0]
         ma5 = self.calculate_ma(code, date, 5)

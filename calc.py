@@ -801,7 +801,7 @@ def get_trade_signal(code: str, date: str, hold: int,
         sl_stage: 时间止损减仓阶段（0未触发；1已减仓1次；2已减仓2次(封顶)）
 
     返回:
-        (交易决策, 历史数据列表, 当前价格)
+        (交易决策, 历史数据列表, 综合得分)
     """
     # 加载历史数据
     data = load_historical_data(code, date, db_path, table_name)
@@ -820,6 +820,7 @@ def get_trade_signal(code: str, date: str, hold: int,
     if use_industry_alpha and industry_alpha_score != 0.0:
         strategy.apply_industry_alpha(industry_alpha_score, industry_rank, alpha_weight=industry_alpha_weight)
 
+    composite_score = strategy.get_composite_score()
     decision = strategy.generate_signal(hold, entry_price, highest_price, hold_days, tp_stage, sl_stage)
 
     # 如果启用了行业 Alpha，在理由中追加信息
@@ -827,7 +828,7 @@ def get_trade_signal(code: str, date: str, hold: int,
         industry_tag = f"[行业排名{industry_rank}]"
         decision.reason = f"{industry_tag} {decision.reason}"
 
-    return decision, data, current_price
+    return decision, data, composite_score
 
 
 def calculate_factors(code: str, date: str) -> Dict[str, float]:

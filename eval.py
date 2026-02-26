@@ -23,6 +23,10 @@ from const import (
     STOCK_DB_PATH, get_full_stock, MAX_WORKERS,
     USE_INDUSTRY_ALPHA, INDUSTRY_ALPHA_WEIGHT,
     LIQUIDITY_MIN_AVG_AMOUNT_20D, MIN_LISTING_DAYS,
+    TIME_STOP_DAYS, TIME_STOP_SCORE_THRESHOLD,
+    OUTPUT_PREFIX, RUN_TAG,
+    MIN_STOP_LOSS_PCT, TRAIL_STOP_PCT, ATR_MULTIPLIER,
+    RM_MAX_POSITION, RM_MAX_TOTAL_POSITION,
 )
 
 from tradable_filter import TradableFilterConfig, check_tradable
@@ -40,20 +44,15 @@ try:
 except ImportError:
     INDUSTRY_ALPHA_AVAILABLE = False
 
+# 导入数据缓存
+from data_cache import init_cache
+
 # 输出文件路径（默认会带参数与时间戳，避免覆盖）
 # 可通过环境变量 OUTPUT_FILE 覆盖为固定文件名。
-DEFAULT_OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "eval_output")
 RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
-RUN_TAG = os.environ.get("RUN_TAG", "")
-# 默认参数（不指定环境变量时使用）——当前推荐：E 组
-DEFAULT_TIME_STOP_DAYS = 10  # 10天效果最好
-DEFAULT_TIME_STOP_SCORE_THRESHOLD = -0.1  # 保持-0.1
-
-TIME_STOP_DAYS = int(os.environ.get("TIME_STOP_DAYS", str(DEFAULT_TIME_STOP_DAYS)))
-TIME_STOP_SCORE_THRESHOLD = float(os.environ.get("TIME_STOP_SCORE_THRESHOLD", str(DEFAULT_TIME_STOP_SCORE_THRESHOLD)))
 
 # 文件名只保留时间戳
-DEFAULT_OUTPUT_NAME = f"eval_output_{RUN_TS}.txt"
+DEFAULT_OUTPUT_NAME = f"{OUTPUT_PREFIX}_{RUN_TS}.txt"
 OUTPUT_FILE = Path(os.environ.get("OUTPUT_FILE", str(Path(__file__).parent / DEFAULT_OUTPUT_NAME)))
 
 # 数据库配置›
@@ -101,11 +100,6 @@ def get_stock_pool():
 # 初始资金 (RMB)
 INITIAL_CASH = INITIAL_CAPITAL
 
-# 每只股票最大持仓比例（相对于总资金）
-MAX_STOCK_POSITION = 0.2     # 单只股票最多占用 20% 资金
-
-
-
 # ==================== 回测类定义 ====================
 
 
@@ -151,6 +145,116 @@ class DailyRecord:
 
 class MultiStockBacktestEngine:
     """多股票回测引擎（集成风控和市场情绪）"""
+
+    def _get_tradable_result(self, code: str, date: str):
+        """获取（并缓存）某日某票的可交易过滤结果。
+
+        说明：
+        - 仅用于拦截 BUY（SELL 一律放行以便退出）。
+        - 使用单连接复用，避免每票重复 connect。
+        """
+        day_cache = self.tradable_cache.get(date)
+        if day_cache is None:
+            day_cache = {}
+            self.tradable_cache[date] = day_cache
+
+        tr = day_cache.get(code)
+        if tr is not None:
+            return tr
+
+        cfg = TradableFilterConfig(
+            amount_window=20,
+            min_avg_amount=LIQUIDITY_MIN_AVG_AMOUNT_20D,
+            min_listing_days=MIN_LISTING_DAYS,
+        )
+
+        conn = getattr(self, "_tradable_conn", None)
+        if conn is None:
+            self._tradable_conn = sqlite3.connect(DB_PATH)
+            conn = self._tradable_conn
+
+        tr = check_tradable(conn, code, date, cfg)
+        day_cache[code] = tr
+        return tr
+
+    def _get_industry_alpha_params(self, code: str, date: str) -> Tuple[bool, float, int]:
+        """获取（并缓存）行业 Alpha 参数：是否启用、得分、行业排名。
+
+        性能说明：
+        - 这里仅需要行业层面的 (alpha_score, alpha_rank) 来注入 calc.py 的行业因子项。
+        - 避免对每只股票调用 calculate_stock_alpha_in_industry（其内部会反复计算全行业因子，
+          且还会做行业内股票分位数计算，成本非常高）。
+        - 本实现按“每个交易日计算一次行业 Alpha 因子”，并通过 code->industry 映射取值。
+        """
+        if not (self.use_industry_alpha and self.industry_alpha_calculator):
+            return False, 0.0, 999
+
+        day_cache = self.industry_alpha_cache.get(date)
+        if day_cache is None:
+            day_cache = {}
+            self.industry_alpha_cache[date] = day_cache
+
+        cached = day_cache.get(code)
+        if cached is not None:
+            return cached
+
+        industry = self.stock_industry_map.get(code)
+        if not industry:
+            day_cache[code] = (False, 0.0, 999)
+            return day_cache[code]
+
+        factors = day_cache.get("_industry_factors")
+        if factors is None:
+            factors = {}
+            try:
+                ind_factors = self.industry_alpha_calculator.calculate_industry_alpha_factors(date)
+                for f in ind_factors:
+                    factors[f.industry] = (float(f.alpha_score), int(f.alpha_rank))
+            except Exception:
+                factors = {}
+            day_cache["_industry_factors"] = factors
+
+        alpha = factors.get(industry)
+        if not alpha:
+            day_cache[code] = (False, 0.0, 999)
+            return day_cache[code]
+
+        alpha_score, alpha_rank = alpha
+        day_cache[code] = (True, alpha_score, alpha_rank)
+        return day_cache[code]
+
+    def _load_stock_industry_map(self):
+        """从 stock_industry 表加载股票->行业映射（一次性，避免循环查询）。"""
+        if not self.industry_alpha_calculator:
+            return
+
+        mapping_table = getattr(self.industry_alpha_calculator, "mapping_table", "stock_industry")
+        if not self.stock_pool:
+            return
+
+        # SQLite 参数默认上限 999；留出余量
+        chunk_size = 800
+        out: Dict[str, str] = {}
+
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.cursor()
+            for i in range(0, len(self.stock_pool), chunk_size):
+                chunk = self.stock_pool[i:i + chunk_size]
+                if not chunk:
+                    continue
+                placeholders = ",".join(["?"] * len(chunk))
+                cur.execute(
+                    f"SELECT code, industry FROM {mapping_table} WHERE code IN ({placeholders})",
+                    chunk,
+                )
+                for c, ind in cur.fetchall():
+                    if c and ind:
+                        out[str(c)] = str(ind)
+        finally:
+            conn.close()
+
+        self.stock_industry_map = out
 
     def _update_event_stats(self, trade: Dict):
         """按 trade['reason'] 归因统计事件次数，并对 SELL reason 做聚合。
@@ -243,10 +347,12 @@ class MultiStockBacktestEngine:
         self.use_industry_alpha = USE_INDUSTRY_ALPHA and INDUSTRY_ALPHA_AVAILABLE
         self.industry_alpha_calculator = None
         self.industry_alpha_cache: Dict[str, Dict] = {}  # 日期 -> 行业Alpha数据
+        self.stock_industry_map: Dict[str, str] = {}  # code -> industry（一次性加载）
         if self.use_industry_alpha:
             try:
                 self.industry_alpha_calculator = IndustryAlphaCalculator()
                 print(f"行业 Alpha 因子已启用 (权重: {INDUSTRY_ALPHA_WEIGHT})")
+                self._load_stock_industry_map()
             except Exception as e:
                 print(f"行业 Alpha 因子初始化失败: {e}")
                 self.use_industry_alpha = False
@@ -300,24 +406,37 @@ class MultiStockBacktestEngine:
         
         参数:
             args: (code, date, price, position_shares, position_avg_cost, 
-                   position_highest_price, position_hold_days, tp_stage, sl_stage, initial_cash)
+                   position_highest_price, position_hold_days, tp_stage, sl_stage, initial_cash,
+                   rm_min_stop_loss_pct, rm_trail_stop_pct, rm_atr_multiplier, rm_time_stop_days,
+                   rm_max_position, rm_max_total_position,
+                   use_industry_alpha, industry_alpha_score, industry_rank, industry_alpha_weight)
         
         返回:
             信号信息字典
         """
         (code, date, price, position_shares, position_avg_cost,
-         position_highest_price, position_hold_days, tp_stage, sl_stage, initial_cash) = args
+         position_highest_price, position_hold_days, tp_stage, sl_stage, initial_cash,
+         rm_min_stop_loss_pct, rm_trail_stop_pct, rm_atr_multiplier, rm_time_stop_days,
+         rm_max_position, rm_max_total_position,
+         use_industry_alpha, industry_alpha_score, industry_rank, industry_alpha_weight) = args
         
         try:
             # 导入必要的模块（在子进程中）
             from calc import get_trade_signal, RiskManager
             from const import STOCK_DB_PATH, MAX_POSITION, MIN_POSITION, SINGLE_TRADE_RATIO
             
-            # 创建独立的风险管理器实例（参数需与主进程兼容）
-            risk_manager = RiskManager(min_stop_loss_pct=0.10)
+            # 创建独立的风险管理器实例（参数与主进程完全一致）
+            risk_manager = RiskManager(
+                min_stop_loss_pct=rm_min_stop_loss_pct,
+                trail_stop_pct=rm_trail_stop_pct,
+                atr_multiplier=rm_atr_multiplier,
+                time_stop_days=rm_time_stop_days,
+                max_position=rm_max_position,
+                max_total_position=rm_max_total_position
+            )
             
             # 调用信号生成
-            decision, _, _ = get_trade_signal(
+            decision, _, composite_score = get_trade_signal(
                 code=code,
                 date=date,
                 hold=position_shares,
@@ -332,7 +451,11 @@ class MultiStockBacktestEngine:
                 tp_stage=tp_stage if position_shares > 0 else 0,
                 sl_stage=sl_stage if position_shares > 0 else 0,
                 db_path=STOCK_DB_PATH,
-                table_name="stock_daily"
+                table_name="stock_daily",
+                industry_alpha_score=industry_alpha_score,
+                industry_rank=industry_rank,
+                use_industry_alpha=use_industry_alpha,
+                industry_alpha_weight=industry_alpha_weight,
             )
             
             return {
@@ -340,7 +463,9 @@ class MultiStockBacktestEngine:
                 'signal': decision.signal.value,
                 'shares': decision.shares,
                 'reason': decision.reason,
-                'score': decision.confidence,
+                # score 用于排序/回测诊断：这里应当是“综合得分”，不是置信度
+                'score': composite_score,
+                'confidence': decision.confidence,
                 'price': price
             }
         except Exception as e:
@@ -350,14 +475,28 @@ class MultiStockBacktestEngine:
                 'shares': 0,
                 'reason': f'信号生成失败: {str(e)}',
                 'score': 0,
+                'confidence': 0,
                 'price': price
             }
 
     def _prepare_signal_args(self, date: str, daily_prices: Dict[str, float]) -> List[Tuple]:
-        """准备多进程计算的参数列表"""
+        """准备多进程计算的参数列表（包含RiskManager/行业Alpha参数）"""
         args_list = []
+        # 获取RiskManager参数，确保多进程子进程使用与主进程一致的参数
+        rm = self.risk_manager
+        rm_params = (
+            rm.min_stop_loss_pct,
+            rm.trail_stop_pct,
+            rm.atr_multiplier,
+            rm.time_stop_days,
+            rm.max_position,
+            rm.max_total_position
+        )
+        # 行业 Alpha 参数（尽量一次性准备，避免在子进程重复初始化）
+        alpha_weight = INDUSTRY_ALPHA_WEIGHT
         for code, price in daily_prices.items():
             position = self.positions[code]
+            use_alpha, alpha_score, alpha_rank = self._get_industry_alpha_params(code, date)
             args = (
                 code,
                 date,
@@ -368,7 +507,13 @@ class MultiStockBacktestEngine:
                 position.hold_days,
                 position.tp_stage,
                 position.sl_stage,
-                self.initial_cash
+                self.initial_cash,
+                *rm_params  # 展开RiskManager参数
+                ,
+                use_alpha,
+                alpha_score,
+                alpha_rank,
+                alpha_weight,
             )
             args_list.append(args)
         return args_list
@@ -414,6 +559,7 @@ class MultiStockBacktestEngine:
                             'shares': 0,
                             'reason': f'多进程计算失败: {str(e)}',
                             'score': 0,
+                            'confidence': 0,
                             'price': daily_prices[code]
                         })
         
@@ -430,7 +576,7 @@ class MultiStockBacktestEngine:
         """
         def sort_key(signal_info):
             signal = signal_info['signal']
-            score = signal_info['score']
+            score = float(signal_info.get('score') or 0.0)
             
             if signal == 'SELL':
                 # 卖出信号优先级最高，按评分降序（先止损）
@@ -498,20 +644,30 @@ class MultiStockBacktestEngine:
 
     def get_trading_days(self) -> List[str]:
         """获取所有交易日列表（取所有股票交易日的并集）"""
+        if not self.stock_pool:
+            return []
+
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+        days_set = set()
 
-        # 获取在日期范围内有任意股票数据的所有交易日
-        cursor.execute(f"""
-            SELECT DISTINCT date FROM {TABLE_NAME}
-            WHERE code IN ({','.join(['?' for _ in self.stock_pool])})
-            AND date >= ? AND date <= ?
-            ORDER BY date ASC
-        """, self.stock_pool + [self.start_date, self.end_date])
+        # 避免 SQLite 参数上限（通常 999）导致 "too many SQL variables"
+        chunk_size = 800
+        for i in range(0, len(self.stock_pool), chunk_size):
+            chunk = self.stock_pool[i:i + chunk_size]
+            if not chunk:
+                continue
+            placeholders = ",".join(["?"] * len(chunk))
+            cursor.execute(f"""
+                SELECT DISTINCT date FROM {TABLE_NAME}
+                WHERE code IN ({placeholders})
+                AND date >= ? AND date <= ?
+            """, chunk + [self.start_date, self.end_date])
+            for row in cursor.fetchall():
+                days_set.add(row[0])
 
-        days = [row[0] for row in cursor.fetchall()]
         conn.close()
-        return days
+        return sorted(days_set)
 
     def generate_signal(self, code: str, date: str, price: float) -> Tuple[str, int, str]:
         # 统计：每日信号覆盖率（总计数，避免逐日输出过大）
@@ -793,6 +949,7 @@ class MultiStockBacktestEngine:
                 shares = signal_info['shares']
                 reason = signal_info['reason']
                 score = signal_info['score']
+                confidence = signal_info.get('confidence', 0)
                 # 交易撮合用 raw 价格（真实可成交价格）；估值用 ffill
                 price = daily_prices_raw.get(code)
                 if price is None:
@@ -803,6 +960,39 @@ class MultiStockBacktestEngine:
                     if not hasattr(self, "event_stats"):
                         self.event_stats = {"STOP_LOSS": 0, "TP1": 0, "TP2": 0, "TAKE_PROFIT_COMPAT": 0, "SELL_OTHER": 0, "BUY": 0, "FILTER_BLOCK": 0}
                     self.event_stats["FILTER_BLOCK"] += 1
+
+                # ========== 可交易池过滤（仅拦截 BUY；SELL 一律放行） ==========
+                if signal == "BUY":
+                    try:
+                        tr = self._get_tradable_result(code, date)
+                        if not tr.tradable and self.positions[code].shares <= 0:
+                            if not hasattr(self, "tradable_filter_stats"):
+                                self.tradable_filter_stats = {"blocked": 0, "blocked_by_reason": {}}
+                            self.tradable_filter_stats["blocked"] += 1
+                            reason_key = (tr.reason or "UNKNOWN")[:80]
+                            self.tradable_filter_stats["blocked_by_reason"][reason_key] = (
+                                self.tradable_filter_stats["blocked_by_reason"].get(reason_key, 0) + 1
+                            )
+                            if not hasattr(self, "event_stats"):
+                                self.event_stats = {
+                                    "STOP_LOSS_FULL": 0,
+                                    "STOP_LOSS_PARTIAL": 0,
+                                    "TP1": 0,
+                                    "TP2": 0,
+                                    "TAKE_PROFIT_COMPAT": 0,
+                                    "SELL_OTHER": 0,
+                                    "BUY": 0,
+                                    "FILTER_BLOCK": 0,
+                                }
+                            self.event_stats["FILTER_BLOCK"] += 1
+                            continue
+                    except Exception:
+                        if not hasattr(self, "tradable_filter_stats"):
+                            self.tradable_filter_stats = {"blocked": 0, "blocked_by_reason": {}}
+                        self.tradable_filter_stats["blocked"] += 1
+                        self.tradable_filter_stats["blocked_by_reason"]["EXCEPTION"] = (
+                            self.tradable_filter_stats["blocked_by_reason"].get("EXCEPTION", 0) + 1
+                        )
 
                 if signal != "HOLD":
                     # 买入前检查仓位限制
@@ -834,7 +1024,8 @@ class MultiStockBacktestEngine:
                         self._update_event_stats(trade)
 
                         trade["name"] = self.get_stock_name(code)
-                        trade['score'] = score  # 记录评分
+                        trade['score'] = score  # 记录综合得分（非置信度）
+                        trade['confidence'] = confidence
                         daily_trades.append(trade)
                         total_commission += trade["commission"]
                         total_stamp_tax += trade["stamp_tax"]
@@ -1083,7 +1274,16 @@ class MultiStockBacktestEngine:
         total_return = (last_record.total_value - self.initial_cash) / self.initial_cash * 100
         max_value = max(r.total_value for r in self.records)
         min_value = min(r.total_value for r in self.records)
-        max_drawdown = min(r.cumulative_return for r in self.records)
+        # 标准口径：相对历史峰值的最大回撤（百分比，负数）
+        peak_value = self.records[0].total_value if self.records else self.initial_cash
+        max_drawdown = 0.0
+        for r in self.records:
+            if r.total_value > peak_value:
+                peak_value = r.total_value
+            if peak_value > 0:
+                drawdown = (r.total_value - peak_value) / peak_value * 100
+                if drawdown < max_drawdown:
+                    max_drawdown = drawdown
 
         # 计算总交易成本
         total_commission = sum(r.total_commission for r in self.records)
@@ -1240,16 +1440,21 @@ def main():
     print(f"\n股票池数量: {len(stock_pool)} 只")
     if len(stock_pool) > 500:
         print(f"注意: 股票数量较多({len(stock_pool)}只)，回测可能需要较长时间")
+    
+    # 初始化数据缓存（预加载所有股票数据到内存）
+    print("\n[优化] 正在初始化数据缓存...")
+    init_cache(stock_pool, START_DATE, END_DATE, use_disk_cache=True)
+    print("[优化] 数据缓存初始化完成，回测将使用内存数据而非数据库查询\n")
 
-    # 创建风险管理器（可根据需要调整参数）
+    # 创建风险管理器（使用const.py中的参数）
     risk_manager = RiskManager(
-        # 已改为 ATR/波动自适应止损：min_stop_loss_pct 仅作为“最小止损宽度”下限
-        min_stop_loss_pct=0.10,  # 最小止损宽度下限（10%）
-        trail_stop_pct=0.10,     # 10%移动止损
-        atr_multiplier=2.0,      # ATR止损倍数
-        time_stop_days=TIME_STOP_DAYS,       # 可通过环境变量 TIME_STOP_DAYS 覆盖
-        max_position=0.1,        # 单只股票最大仓位10%（降低集中度）
-        max_total_position=0.8   # 总最大仓位80%
+        # ATR/波动自适应止损：min_stop_loss_pct 仅作为"最小止损宽度"下限
+        min_stop_loss_pct=MIN_STOP_LOSS_PCT,
+        trail_stop_pct=TRAIL_STOP_PCT,
+        atr_multiplier=ATR_MULTIPLIER,
+        time_stop_days=TIME_STOP_DAYS,
+        max_position=RM_MAX_POSITION,
+        max_total_position=RM_MAX_TOTAL_POSITION
     )
 
     engine = MultiStockBacktestEngine(

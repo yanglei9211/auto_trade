@@ -146,10 +146,11 @@ class IndustryEnhancedStrategy:
             if industry_alpha and industry_alpha['alpha_rank'] <= 5:
                 # 强势行业中的股票，信号提升
                 shares = self.base_strategy.risk_manager.calculate_position_size(
-                    price=self.base_strategy.current_price,
+                    confidence=min(abs(enhanced_score), 1.0),
+                    volatility=self.base_strategy.volatility,
                     atr=self.base_strategy.atr,
-                    cash=self.base_strategy.initial_capital * 0.2,  # 单只股票最多20%
-                    volatility=self.base_strategy.volatility
+                    available_capital=self.base_strategy.initial_capital * 0.2,  # 单只股票最多20%
+                    current_price=self.base_strategy.current_price,
                 )
 
                 reason = f"{base_decision.reason} | 行业Alpha增强: {industry_alpha['industry']}排名{industry_alpha['alpha_rank']}"
