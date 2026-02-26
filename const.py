@@ -106,6 +106,30 @@ STOCK_LIST_FILE = "/Users/yanglei/Documents/moltbot/scripts/stock_list.txt"
 # 多进程配置
 MAX_WORKERS = 8  # 最大并行进程数
 
+# ==================== 风控/信号参数 ====================
+# 备注：这些参数由 eval.py 导入，且用于构建 RiskManager 与输出文件命名。
+
+# 时间止损参数
+TIME_STOP_DAYS = 10
+TIME_STOP_SCORE_THRESHOLD = -0.1
+
+# 输出参数
+OUTPUT_PREFIX = "eval_output"
+RUN_TAG = ""
+
+# 止损参数
+MIN_STOP_LOSS_PCT = 0.10
+TRAIL_STOP_PCT = 0.09
+ATR_MULTIPLIER = 2.0
+
+# 仓位参数（按“最小改动方案”下调）
+RM_MAX_POSITION = 0.15
+RM_MAX_TOTAL_POSITION = 0.7
+
+# 信号阈值（按“最小改动方案”调整）
+BUY_SIGNAL_THRESHOLD = 0.18
+SELL_SIGNAL_THRESHOLD = -0.10
+
 
 def get_full_stock():
     """

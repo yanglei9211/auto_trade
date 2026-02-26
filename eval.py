@@ -35,7 +35,7 @@ from tradable_filter import TradableFilterConfig, check_tradable
 from calc import RiskManager, get_trade_signal, Signal
 
 # 导入市场情绪分析
-from market_sentiment import get_market_sentiment, get_position_limit
+from market_sentiment import get_market_sentiment, get_position_limit, get_dynamic_position_cap
 
 # 导入行业 Alpha 因子（可选）
 try:
@@ -44,8 +44,13 @@ try:
 except ImportError:
     INDUSTRY_ALPHA_AVAILABLE = False
 
-# 导入数据缓存
-from data_cache import init_cache
+# 导入数据缓存（可选）
+try:
+    from data_cache import init_cache
+except ImportError:
+    def init_cache(*args, **kwargs):
+        print("[警告] data_cache 模块不存在，已降级为无缓存模式")
+        return None
 
 # 输出文件路径（默认会带参数与时间戳，避免覆盖）
 # 可通过环境变量 OUTPUT_FILE 覆盖为固定文件名。
@@ -376,17 +381,23 @@ class MultiStockBacktestEngine:
     def update_market_sentiment(self, date: str) -> Dict:
         """更新市场情绪并返回情绪数据"""
         if not self.enable_market_sentiment:
-            self.current_position_limit = 1.0
+            self.current_position_limit = min(1.0, float(self.risk_manager.max_total_position))
             return {"score": 1.0, "position_ratio": 1.0, "description": "情绪控制已关闭"}
         
         try:
             sentiment = get_market_sentiment(date)
-            self.current_position_limit = sentiment["position_ratio"]
+            # 动态总仓位上限：由“市场热度(score)”映射，并叠加 RiskManager 的硬上限
+            self.current_position_limit = get_dynamic_position_cap(
+                score=sentiment.get("score", 1.0),
+                base_cap=float(self.risk_manager.max_total_position),
+                min_cap=0.20,
+                max_cap=0.95,
+            )
             self.sentiment_history[date] = sentiment
             return sentiment
         except Exception as e:
             # 如果情绪分析失败，默认允许满仓
-            self.current_position_limit = 1.0
+            self.current_position_limit = min(1.0, float(self.risk_manager.max_total_position))
             return {"score": 1.0, "position_ratio": 1.0, "description": f"情绪分析失败: {e}"}
 
     def can_open_new_position(self, daily_prices: Dict[str, float], planned_invest: float) -> bool:
@@ -1089,8 +1100,26 @@ class MultiStockBacktestEngine:
         sentiment = self.sentiment_history.get(record.date, {})
         if sentiment:
             self.print_and_write(f"\n【市场情绪】")
-            self.print_and_write(f"  情绪得分: {sentiment.get('score', 0):.2f}")
+            score = float(sentiment.get("score", 0) or 0)
+            # 动态仓位上限（与 run() 中 update_market_sentiment 的逻辑保持一致）
+            cap = get_dynamic_position_cap(
+                score=score,
+                base_cap=float(self.risk_manager.max_total_position),
+                min_cap=0.20,
+                max_cap=0.95,
+            )
+            # 实际当前仓位（当日估值口径）
+            mv = 0.0
+            for c, pos in record.positions.items():
+                if pos and pos.shares > 0:
+                    px = record.prices.get(c)
+                    if px is not None:
+                        mv += pos.shares * px
+            pos_ratio = (mv / record.total_value) if record.total_value > 0 else 0.0
+
+            self.print_and_write(f"  情绪得分: {score:.2f}")
             self.print_and_write(f"  仓位限制: {sentiment.get('position_ratio', 1.0)*100:.0f}%")
+            self.print_and_write(f"  热度→动态cap→当前仓位: {score:.2f} → {cap*100:.0f}% → {pos_ratio*100:.1f}%")
             self.print_and_write(f"  情绪描述: {sentiment.get('description', 'N/A')}")
             self.print_and_write(f"  ETF状态: MA5上方{sentiment.get('above_ma5_count', 0)}/{sentiment.get('total_etfs', 5)}, "
                                f"MA20上方{sentiment.get('above_ma20_count', 0)}/{sentiment.get('total_etfs', 5)}, "

@@ -198,6 +198,47 @@ class MarketSentimentAnalyzer:
         }
 
 
+def get_dynamic_position_cap(
+    score: float,
+    base_cap: float = 0.80,
+    min_cap: float = 0.20,
+    max_cap: float = 0.95,
+) -> float:
+    """将市场情绪得分(score)映射为“总仓位上限”。
+
+    目标：
+    - 弱势时自动收缩仓位，降低回撤与磨损。
+    - 强势时允许较高仓位，避免“行情好仓位不够”。
+
+    说明：
+    - score 来自 analyze_sentiment() 的 0~1 打分。
+    - base_cap 是风险管理器层面的硬上限（例如 RM_MAX_TOTAL_POSITION）。
+    - 返回值会被夹在 [min_cap, max_cap]，并且不会超过 base_cap。
+    """
+    try:
+        s = float(score)
+    except Exception:
+        s = 1.0
+
+    # 分段线性：比 position_ratio(0.95/0.7/0.4/0.2) 更平滑。
+    # 经验阈值与 analyze_sentiment 的分段基本对齐。
+    if s <= 0.20:
+        cap = 0.20
+    elif s <= 0.35:
+        # 0.20 -> 0.55
+        cap = 0.20 + (s - 0.20) / 0.15 * 0.35
+    elif s <= 0.55:
+        # 0.55 -> 0.85
+        cap = 0.55 + (s - 0.35) / 0.20 * 0.30
+    else:
+        # 0.85 -> 0.95
+        cap = 0.85 + min((s - 0.55) / 0.45, 1.0) * 0.10
+
+    cap = max(min_cap, min(max_cap, cap))
+    cap = min(cap, float(base_cap))
+    return cap
+
+
 def get_market_sentiment(date: str) -> Dict:
     """
     获取指定日期的市场情绪（便捷函数）
